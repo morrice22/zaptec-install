@@ -213,6 +213,11 @@ log ".env criado com permissao 600 (apenas root le)"
 # -------------------------------------------------------------
 section "Iniciando PostgreSQL e Redis"
 # -------------------------------------------------------------
+# Para e remove containers anteriores para evitar conflito de senha no volume
+docker stop zaptec-db zaptec-redis 2>/dev/null || true
+docker rm   zaptec-db zaptec-redis 2>/dev/null || true
+# Remove dados antigos do Postgres para garantir inicializacao limpa com nova senha
+rm -rf /opt/zaptec-data/postgres
 mkdir -p /opt/zaptec-data/postgres /opt/zaptec-data/redis
 
 cat > "$INSTALL_DIR/docker-compose.prod.yml" <<DCEOF
@@ -257,7 +262,7 @@ log "Banco pronto"
 # -------------------------------------------------------------
 section "Instalando Dependencias e Compilando"
 # -------------------------------------------------------------
-npm ci --omit=dev --quiet && log "Backend: dependencias instaladas"
+npm ci --quiet && log "Backend: dependencias instaladas"
 
 cd "$INSTALL_DIR/frontend"
 npm ci --quiet
@@ -265,7 +270,10 @@ npm run build
 log "Frontend compilado"
 
 cd "$INSTALL_DIR"
-npm run build && log "Backend compilado"
+npm run build
+log "Backend compilado"
+# Remove dependencias de dev apos build (economiza disco)
+npm prune --omit=dev --quiet 2>/dev/null || true
 
 # -------------------------------------------------------------
 section "Migracoes e Seed do Banco"
