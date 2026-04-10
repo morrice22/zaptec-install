@@ -111,7 +111,7 @@ git checkout -- .env 2>/dev/null || true
 # ─── Atualizar dependências do backend ────────────────────────
 section "Atualizando Dependências"
 
-npm ci --omit=dev --quiet
+npm ci --quiet
 log "Dependências do backend atualizadas"
 
 # ─── Rodar migrations (SEGURO - apenas adiciona, nunca apaga dados) ─
