@@ -65,14 +65,15 @@ DATE=$(date +%Y%m%d_%H%M%S)
 
 # Extrai credenciais do .env atual
 DB_URL=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
-DB_HOST=$(echo "$DB_URL" | sed -E 's|.*@([^:/]+).*|\1|')
-DB_PORT=$(echo "$DB_URL" | sed -E 's|.*:([0-9]+)/.*|\1|')
 DB_NAME=$(echo "$DB_URL" | sed -E 's|.*/([^?]+).*|\1|')
 DB_USER=$(echo "$DB_URL" | sed -E 's|.*://([^:]+):.*|\1|')
 DB_PASS=$(echo "$DB_URL" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
 
 BACKUP_FILE="$BACKUP_DIR/pre_update_${DATE}.sql.gz"
-PGPASSWORD="$DB_PASS" pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" "$DB_NAME" \
+
+# Usa pg_dump de DENTRO do container Docker para evitar incompatibilidade de versão
+docker exec zaptec-db \
+  sh -c "PGPASSWORD='${DB_PASS}' pg_dump -U '${DB_USER}' '${DB_NAME}'" \
   | gzip > "$BACKUP_FILE"
 
 BACKUP_SIZE=$(du -sh "$BACKUP_FILE" | cut -f1)
