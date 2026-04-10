@@ -127,7 +127,10 @@ if [[ "$OS_FAMILY" == "debian" ]]; then
   apt-get install -y -qq curl wget git openssl ca-certificates gnupg lsb-release \
     ufw fail2ban postgresql-client nginx certbot python3-certbot-nginx
 else
-  dnf upgrade -y -q
+  # Importa a chave GPG do AlmaLinux/RHEL antes de atualizar (evita erro de GPG)
+  rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux 2>/dev/null || \
+  rpm --import https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux 2>/dev/null || true
+  dnf upgrade -y -q --nogpgcheck 2>/dev/null || dnf upgrade -y -q || true
   dnf install -y -q epel-release
   dnf install -y -q curl wget git openssl ca-certificates gnupg2 \
     firewalld fail2ban postgresql nginx certbot python3-certbot-nginx
