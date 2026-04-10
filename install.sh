@@ -282,12 +282,9 @@ npx prisma generate
 npx prisma migrate deploy
 log "Migracoes aplicadas"
 
-npx tsx prisma/seed.ts && log "Seed executado"
-
-# Define admin master com email/senha escolhidos pelo usuario
-HASHED=$(node -e "const b=require('bcryptjs');console.log(b.hashSync('${ADMIN_PASS}',10))")
-PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -p 5433 -U zaptec -d zaptec_prod \
-  -c "UPDATE users SET email='${ADMIN_EMAIL}', password='${HASHED}' WHERE role='SUPER_ADMIN' LIMIT 1;" 2>/dev/null || true
+# Exporta credenciais para que o seed as use diretamente
+export ADMIN_EMAIL ADMIN_PASS
+ADMIN_EMAIL="$ADMIN_EMAIL" ADMIN_PASS="$ADMIN_PASS" npx tsx prisma/seed.ts && log "Seed executado"
 log "Admin master configurado: $ADMIN_EMAIL"
 
 # -------------------------------------------------------------
