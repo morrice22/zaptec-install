@@ -171,6 +171,13 @@ fi
 
 # ─── Recarregar Nginx ─────────────────────────────────────────
 if systemctl is-active --quiet nginx; then
+  # Garantir que location /uploads/ existe no config (pode faltar em instalações antigas)
+  NGINX_CONF=$(find /etc/nginx/sites-enabled /etc/nginx/conf.d -name "*.conf" 2>/dev/null | head -1)
+  if [[ -n "$NGINX_CONF" ]] && ! grep -q "location /uploads/" "$NGINX_CONF"; then
+    warn "Adicionando location /uploads/ ao nginx (ausente na instalação anterior)..."
+    sed -i '/location \/media\/ {/i \    location \/uploads\/ {\n        proxy_pass http:\/\/127.0.0.1:3000;\n        client_max_body_size 20m;\n    }' "$NGINX_CONF"
+    log "location /uploads/ adicionado ao nginx"
+  fi
   nginx -t && systemctl reload nginx
   log "Nginx recarregado"
 fi
