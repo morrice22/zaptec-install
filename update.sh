@@ -44,10 +44,27 @@ echo -e "${NC}"
 # ─── Verificar serviços dependentes ────────────────────────────
 section "Verificando Serviços"
 
-if ! docker compose -f "$INSTALL_DIR/docker-compose.prod.yml" ps postgres | grep -q "running\|Up"; then
-  error "PostgreSQL não está rodando! Inicie o banco antes de atualizar."
+# Verifica container por nome (independente do arquivo compose usado na instalação)
+if docker ps --format '{{.Names}}' | grep -q "zaptec-db"; then
+  log "PostgreSQL: rodando"
+elif docker compose -f "$INSTALL_DIR/docker-compose.prod.yml" ps 2>/dev/null | grep -q "running\|Up"; then
+  log "PostgreSQL: rodando"
+else
+  # Tenta iniciar o container se ele existir mas estiver parado
+  if docker ps -a --format '{{.Names}}' | grep -q "zaptec-db"; then
+    warn "PostgreSQL parado, iniciando..."
+    if [ -f "$INSTALL_DIR/docker-compose.prod.yml" ]; then
+      docker compose -f "$INSTALL_DIR/docker-compose.prod.yml" up -d
+    else
+      docker compose -f "$INSTALL_DIR/docker-compose.yml" up -d
+    fi
+    sleep 5
+    docker ps --format '{{.Names}}' | grep -q "zaptec-db" || error "PostgreSQL não iniciou. Verifique com: docker ps -a"
+    log "PostgreSQL: iniciado"
+  else
+    error "PostgreSQL não está rodando! Execute: cd $INSTALL_DIR && docker compose up -d"
+  fi
 fi
-log "PostgreSQL: rodando"
 
 if command -v pm2 &>/dev/null; then
   log "PM2: disponível"
