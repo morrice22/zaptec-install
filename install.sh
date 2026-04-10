@@ -206,6 +206,11 @@ WHATSAPP_MEDIA_DIR=${INSTALL_DIR}/public/media
 CORS_ORIGIN=https://${APP_DOMAIN}
 DEFAULT_MAX_CONNECTIONS=3
 DEFAULT_MAX_USERS=5
+
+# Backup Google Drive (opcional — configure em: console.cloud.google.com/apis/credentials)
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REDIRECT_URI=https://${APP_DOMAIN}/api/backup/google/callback
 ENVEOF
 chmod 600 "$INSTALL_DIR/.env"
 log ".env criado com permissao 600 (apenas root le)"
