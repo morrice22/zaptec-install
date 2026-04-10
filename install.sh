@@ -328,6 +328,30 @@ else
   setsebool -P httpd_can_network_connect 1 2>/dev/null || true
 fi
 
+# PASSO 1: Config HTTP simples para que o Certbot consiga validar o dominio
+cat > "$NGINX_CONF" <<NGINXEOF
+server {
+    listen 80;
+    server_name ${APP_DOMAIN};
+    root ${INSTALL_DIR}/frontend/dist;
+    index index.html;
+    location /.well-known/acme-challenge/ { root /var/lib/letsencrypt; }
+    location / { try_files \$uri \$uri/ /index.html; }
+}
+NGINXEOF
+
+if [[ "$OS_FAMILY" == "debian" ]]; then
+  ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/zaptec
+  rm -f /etc/nginx/sites-enabled/default
+fi
+nginx -t && systemctl reload nginx
+log "Nginx HTTP iniciado (aguardando cert SSL)"
+
+# PASSO 2: Emite o certificado SSL
+certbot certonly --nginx -d "$APP_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive
+log "Certificado SSL emitido para $APP_DOMAIN"
+
+# PASSO 3: Substitui pelo config HTTPS completo
 cat > "$NGINX_CONF" <<NGINXEOF
 server {
     listen 80;
@@ -376,13 +400,7 @@ server {
 }
 NGINXEOF
 
-if [[ "$OS_FAMILY" == "debian" ]]; then
-  ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/zaptec
-  rm -f /etc/nginx/sites-enabled/default
-fi
-nginx -t
-
-certbot --nginx -d "$APP_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive --redirect
+nginx -t && systemctl reload nginx
 log "SSL/HTTPS configurado via Lets Encrypt"
 
 (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && systemctl reload nginx") | sort -u | crontab -
