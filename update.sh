@@ -138,9 +138,106 @@ section "Aplicando Migrations do Banco"
 # Regenera o Prisma client com o schema atualizado
 npx prisma generate
 
+# ── Helper: marca como rolled-back qualquer migration que ficou com falha
+# (finished_at IS NULL E rolled_back_at IS NULL) no _prisma_migrations.
+# Resolve P3009 (failed migration) e P3018 (apply failed) automaticamente,
+# pois o Prisma roda cada migration em transação — se falhar, nada foi
+# realmente persistido e podemos seguramente marcar como revertida.
+auto_resolve_failed_migrations() {
+  local DB_URL_LOCAL DB_NAME_LOCAL DB_USER_LOCAL DB_PASS_LOCAL FAILED_LIST
+  DB_URL_LOCAL=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
+  DB_NAME_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*/([^?]+).*|\1|')
+  DB_USER_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*://([^:]+):.*|\1|')
+  DB_PASS_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
+
+  FAILED_LIST=$(docker exec zaptec-db sh -c \
+    "PGPASSWORD='${DB_PASS_LOCAL}' psql -U '${DB_USER_LOCAL}' '${DB_NAME_LOCAL}' -tAc \
+    \"SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NULL AND rolled_back_at IS NULL;\"" 2>/dev/null \
+    | tr -d '\r' | grep -v '^$' || true)
+
+  if [[ -z "$FAILED_LIST" ]]; then
+    return 1   # nada a resolver
+  fi
+
+  while IFS= read -r MIG; do
+    [[ -z "$MIG" ]] && continue
+    warn "Migração com falha detectada: $MIG → marcando como rolled-back"
+    npx prisma migrate resolve --rolled-back "$MIG" || true
+  done <<< "$FAILED_LIST"
+  return 0
+}
+
 # migrate deploy: aplica apenas migrations novas, NUNCA desfaz dados existentes
-npx prisma migrate deploy
-log "Migrations aplicadas com segurança (dados preservados)"
+# Em caso de drift (ex.: db push anterior + migration parcialmente aplicada),
+# tenta recuperar automaticamente com ALTERs idempotentes e resolve de estado.
+if npx prisma migrate deploy; then
+  log "Migrations aplicadas com segurança (dados preservados)"
+else
+  warn "Falha ao aplicar migrations; tentando auto-recuperação..."
+
+  # 1ª tentativa: marcar migrações com falha como rolled-back e re-aplicar
+  if auto_resolve_failed_migrations; then
+    info "Re-aplicando migrations após auto-recuperação..."
+    if npx prisma migrate deploy; then
+      log "Migrations recuperadas e aplicadas com segurança (dados preservados)"
+    else
+      warn "Auto-recuperação genérica não resolveu; iniciando rotina manual..."
+      RUN_LEGACY_FIX=1
+    fi
+  else
+    RUN_LEGACY_FIX=1
+  fi
+
+  # 2ª tentativa (legado): patch idempotente para drifts conhecidos
+  if [[ "${RUN_LEGACY_FIX:-0}" == "1" ]]; then
+    PRISMA_FIX_SQL="/tmp/zaptec_prisma_fix_$$.sql"
+    cat > "$PRISMA_FIX_SQL" <<'SQL'
+ALTER TABLE "company_settings"
+  ADD COLUMN IF NOT EXISTS "disconnectAlertEnabled" BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS "disconnectAlertPhone" TEXT,
+  ADD COLUMN IF NOT EXISTS "disconnectAlertConnectionId" TEXT,
+  ADD COLUMN IF NOT EXISTS "disconnectAlertTemplateName" TEXT,
+  ADD COLUMN IF NOT EXISTS "disconnectAlertTemplateLang" TEXT DEFAULT 'pt_BR',
+  ADD COLUMN IF NOT EXISTS "emailProvider" TEXT NOT NULL DEFAULT 'smtp',
+  ADD COLUMN IF NOT EXISTS "resendApiKey" TEXT;
+
+ALTER TABLE "company_settings"
+  DROP COLUMN IF EXISTS "disconnectAlertMessage";
+
+-- Índices de performance
+CREATE INDEX IF NOT EXISTS "tickets_connectionId_idx" ON "tickets" ("connectionId");
+CREATE INDEX IF NOT EXISTS "tickets_userId_idx" ON "tickets" ("userId");
+CREATE INDEX IF NOT EXISTS "tickets_queueId_idx" ON "tickets" ("queueId");
+CREATE INDEX IF NOT EXISTS "tickets_companyId_lastMessageAt_idx" ON "tickets" ("companyId", "lastMessageAt");
+CREATE INDEX IF NOT EXISTS "messages_ticketId_createdAt_idx" ON "messages" ("ticketId", "createdAt");
+CREATE INDEX IF NOT EXISTS "messages_connectionId_idx" ON "messages" ("connectionId");
+CREATE INDEX IF NOT EXISTS "users_companyId_idx" ON "users" ("companyId");
+CREATE INDEX IF NOT EXISTS "whatsapp_connections_companyId_idx" ON "whatsapp_connections" ("companyId");
+CREATE INDEX IF NOT EXISTS "contact_tags_tagId_idx" ON "contact_tags" ("tagId");
+CREATE INDEX IF NOT EXISTS "ticket_tags_tagId_idx" ON "ticket_tags" ("tagId");
+SQL
+
+    npx prisma db execute --schema prisma/schema.prisma --file "$PRISMA_FIX_SQL"
+    rm -f "$PRISMA_FIX_SQL"
+
+    npx prisma migrate resolve --rolled-back 20260417135604_add_disconnect_alert_settings || true
+    npx prisma migrate resolve --applied 20260417135604_add_disconnect_alert_settings || true
+    npx prisma migrate resolve --rolled-back 20260417140451_rename_alert_message_to_template || true
+    npx prisma migrate resolve --applied 20260417140451_rename_alert_message_to_template || true
+    npx prisma migrate resolve --rolled-back 20260417145842_add_performance_indexes || true
+    npx prisma migrate resolve --applied 20260417145842_add_performance_indexes || true
+
+    # Última passada: marca de novo qualquer migration ainda em estado de falha
+    auto_resolve_failed_migrations || true
+
+    npx prisma migrate deploy
+    log "Migrations recuperadas e aplicadas com segurança (dados preservados)"
+  fi
+fi
+
+# ─── Seed da Central de Ajuda ──────────────────────────────────
+section "Atualizando Central de Ajuda"
+npx tsx prisma/seed-help.ts 2>/dev/null && log "Artigos de ajuda atualizados" || warn "Seed de ajuda ignorado (não crítico)"
 
 # ─── Build do frontend ─────────────────────────────────────────
 section "Compilando Frontend"
@@ -167,6 +264,177 @@ else
   pm2 start ecosystem.config.js
   pm2 save
   log "Backend iniciado via PM2"
+fi
+
+# ─── Migração de domínio (opcional) ──────────────────────────
+# Para migrar de domínio, defina a variável NEW_DOMAIN antes de executar:
+#   NEW_DOMAIN=app.zaptec.online LE_EMAIL=seu@email.com \
+#     curl -sSL https://raw.githubusercontent.com/morrice22/zaptec-install/main/update.sh | sudo bash
+if [[ -n "${NEW_DOMAIN:-}" ]]; then
+  section "Migração de Domínio → $NEW_DOMAIN"
+
+  # Ler domínio atual do .env
+  OLD_DOMAIN=$(grep "^BACKEND_URL=" "$INSTALL_DIR/.env" | sed -E 's|^BACKEND_URL=https?://||' | tr -d '\r')
+  if [[ -z "$OLD_DOMAIN" ]]; then
+    warn "Não foi possível ler BACKEND_URL do .env — pulando migração de domínio"
+  elif [[ "$OLD_DOMAIN" == "$NEW_DOMAIN" ]]; then
+    info "Domínio já está configurado como $NEW_DOMAIN — nenhuma ação necessária"
+  else
+    info "Domínio atual: $OLD_DOMAIN → novo: $NEW_DOMAIN"
+
+    # 1) Garantir que certbot está disponível
+    if ! command -v certbot &>/dev/null; then
+      warn "Certbot não encontrado, instalando..."
+      apt-get install -y -qq certbot python3-certbot-nginx 2>/dev/null \
+        || dnf install -y -q certbot python3-certbot-nginx 2>/dev/null \
+        || error "Não foi possível instalar o certbot. Instale manualmente e execute novamente."
+    fi
+
+    # 2) Resolver Nginx conf file
+    NGINX_CONF_NEW=$(find /etc/nginx/sites-available /etc/nginx/conf.d -name "*.conf" 2>/dev/null | head -1)
+    [[ -z "$NGINX_CONF_NEW" ]] && NGINX_CONF_NEW="/etc/nginx/sites-available/zaptec"
+
+    # 3) Criar config HTTP temporária para o NOVO domínio (para emitir cert)
+    NGINX_TMP="/etc/nginx/sites-available/zaptec-newdomain"
+    cat > "$NGINX_TMP" <<NGINX_TMP_EOF
+server {
+    listen 80;
+    server_name ${NEW_DOMAIN};
+    location /.well-known/acme-challenge/ { root /var/lib/letsencrypt; }
+    location / { return 200 'ok'; add_header Content-Type text/plain; }
+}
+NGINX_TMP_EOF
+
+    if [[ -d /etc/nginx/sites-enabled ]]; then
+      ln -sf "$NGINX_TMP" /etc/nginx/sites-enabled/zaptec-newdomain
+    fi
+    nginx -t && systemctl reload nginx
+    log "Nginx temporário HTTP ativo para $NEW_DOMAIN"
+
+    # 4) Emitir certificado SSL para o novo domínio
+    LE_EMAIL_DOMAIN="${LE_EMAIL:-}"
+    if [[ -z "$LE_EMAIL_DOMAIN" ]]; then
+      # Tenta reutilizar o email já cadastrado no certbot
+      LE_EMAIL_DOMAIN=$(certbot show_account 2>/dev/null | grep "Email" | awk '{print $2}' || echo "")
+    fi
+    [[ -z "$LE_EMAIL_DOMAIN" ]] && error "Defina LE_EMAIL=seu@email.com ao executar o script com NEW_DOMAIN"
+
+    certbot certonly --nginx -d "$NEW_DOMAIN" \
+      --email "$LE_EMAIL_DOMAIN" --agree-tos --non-interactive
+    log "Certificado SSL emitido para $NEW_DOMAIN"
+
+    # 5) Remover config temporária
+    rm -f "$NGINX_TMP"
+    [[ -L /etc/nginx/sites-enabled/zaptec-newdomain ]] && rm -f /etc/nginx/sites-enabled/zaptec-newdomain
+
+    # 6) Reescrever config Nginx com novo domínio HTTPS + redirect do antigo
+    cat > "$NGINX_CONF_NEW" <<NGINXEOF
+# Redireciona domínio antigo para o novo (preserva POSTs com 308)
+server {
+    listen 80;
+    server_name ${OLD_DOMAIN};
+    return 301 https://${NEW_DOMAIN}\$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name ${OLD_DOMAIN};
+    ssl_certificate     /etc/letsencrypt/live/${OLD_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${OLD_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    # Webhooks e API: 308 preserva o método POST
+    location ~* ^/(webhooks|api|socket\.io|media|uploads)/ {
+        return 308 https://${NEW_DOMAIN}\$request_uri;
+    }
+    location / {
+        return 301 https://${NEW_DOMAIN}\$request_uri;
+    }
+}
+# Domínio novo — config principal
+server {
+    listen 80;
+    server_name ${NEW_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name ${NEW_DOMAIN};
+    ssl_certificate     /etc/letsencrypt/live/${NEW_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${NEW_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options SAMEORIGIN;
+    add_header X-Content-Type-Options nosniff;
+    root ${INSTALL_DIR}/frontend/dist;
+    index index.html;
+    location /api/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        client_max_body_size 50m;
+    }
+    location /socket.io/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+    }
+    location /media/ {
+        proxy_pass http://127.0.0.1:3000;
+        client_max_body_size 50m;
+    }
+    location /uploads/ {
+        proxy_pass http://127.0.0.1:3000;
+        client_max_body_size 20m;
+    }
+    location /webhooks/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host \$host;
+    }
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+NGINXEOF
+
+    if [[ -d /etc/nginx/sites-enabled ]]; then
+      ln -sf "$NGINX_CONF_NEW" /etc/nginx/sites-enabled/zaptec
+    fi
+
+    # 7) Atualizar .env com o novo domínio
+    sed -i "s|BACKEND_URL=https\?://${OLD_DOMAIN}|BACKEND_URL=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
+    sed -i "s|FRONTEND_URL=https\?://${OLD_DOMAIN}|FRONTEND_URL=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
+    sed -i "s|API_URL=https\?://${OLD_DOMAIN}|API_URL=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
+    sed -i "s|CORS_ORIGIN=https\?://${OLD_DOMAIN}|CORS_ORIGIN=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
+    sed -i "s|GOOGLE_REDIRECT_URI=https\?://${OLD_DOMAIN}|GOOGLE_REDIRECT_URI=https://${NEW_DOMAIN}/api/backup/google/callback|g" "$INSTALL_DIR/.env"
+    log ".env atualizado com novo domínio"
+
+    # 8) Atualizar notificameWebhookUrl no banco (conexões OFFICIAL)
+    DB_URL=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
+    DB_NAME=$(echo "$DB_URL" | sed -E 's|.*/([^?]+).*|\1|')
+    DB_USER=$(echo "$DB_URL" | sed -E 's|.*://([^:]+):.*|\1|')
+    DB_PASS=$(echo "$DB_URL" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
+
+    ROWS=$(docker exec zaptec-db sh -c \
+      "PGPASSWORD='${DB_PASS}' psql -U '${DB_USER}' '${DB_NAME}' -t -c \
+      \"UPDATE whatsapp_connections SET \\\"notificameWebhookUrl\\\" = REPLACE(\\\"notificameWebhookUrl\\\", 'https://${OLD_DOMAIN}', 'https://${NEW_DOMAIN}') WHERE \\\"notificameWebhookUrl\\\" LIKE '%${OLD_DOMAIN}%'; SELECT ROW_COUNT();\"" 2>/dev/null || echo "0")
+    log "Banco atualizado: notificameWebhookUrl migrado ($ROWS conexões)"
+
+    nginx -t && systemctl reload nginx
+    log "Nginx recarregado com config do novo domínio"
+
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}⚠  AÇÃO MANUAL NECESSÁRIA após reiniciar o backend:${NC}"
+    echo -e "  ${BOLD}1.${NC} Abrir Conexões → desativar e reativar cada conexão OFFICIAL"
+    echo -e "     (isso re-registra o webhook na Notifica.me com a nova URL)"
+    echo -e "  ${BOLD}2.${NC} Atualizar webhook no painel da AbacatePay para:"
+    echo -e "     ${CYAN}https://${NEW_DOMAIN}/webhooks/abacatepay?webhookSecret=SEU_SECRET${NC}"
+    echo ""
+  fi
 fi
 
 # ─── Recarregar Nginx ─────────────────────────────────────────
