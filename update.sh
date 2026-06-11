@@ -5,10 +5,15 @@
 # Este script fica no repo PUBLICO: morrice22/zaptec-install
 #
 # COMO USAR na VPS:
+#
+# Hub central (branch main — padrão):
 #   curl -sSL https://raw.githubusercontent.com/morrice22/zaptec-install/main/update.sh | sudo bash
 #
-# Ou com versão específica:
-#   VERSION=v2.1.0 curl -sSL https://raw.githubusercontent.com/morrice22/zaptec-install/main/update.sh | sudo bash
+# VM cliente (branch clientes — consome ZapTec Hub):
+#   VERSION=clientes curl -sSL https://raw.githubusercontent.com/morrice22/zaptec-install/main/update.sh | sudo bash
+#
+# Tag ou branch específica:
+#   VERSION=v2.1.0 curl -sSL .../update.sh | sudo bash
 # =============================================================
 
 set -euo pipefail
@@ -29,10 +34,54 @@ warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
 error()   { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 section() { echo -e "\n${BOLD}${CYAN}══ $1 ══${NC}"; }
 
+# Garante variável KEY=VALUE no arquivo (cria ou substitui linha existente).
+set_env_var() {
+  local key="$1" value="$2" file="$3"
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    echo "${key}=${value}" >> "$file"
+  fi
+}
+
+# Branch clientes → VM filha (credenciais Hub, sem signup Meta local).
+configure_clientes_profile() {
+  section "Perfil: VM Cliente (branch clientes)"
+  set_env_var "ZAPTEC_CLIENTES_MODE" "true" "$INSTALL_DIR/.env"
+  set_env_var "VITE_ZAPTEC_CLIENTES_MODE" "true" "$INSTALL_DIR/frontend/.env"
+  log "ZAPTEC_CLIENTES_MODE=true (.env)"
+  log "VITE_ZAPTEC_CLIENTES_MODE=true (frontend/.env)"
+  info "Conexões Cloud API/Instagram: use URL + API Key do Hub central"
+}
+
+# Branch main → Hub central (Meta direto, API Externa para VMs filhas).
+configure_hub_profile() {
+  section "Perfil: Hub Central (branch main)"
+  if grep -q "^ZAPTEC_CLIENTES_MODE=" "$INSTALL_DIR/.env" 2>/dev/null; then
+    set_env_var "ZAPTEC_CLIENTES_MODE" "false" "$INSTALL_DIR/.env"
+    log "ZAPTEC_CLIENTES_MODE=false (.env)"
+  fi
+  if [[ -f "$INSTALL_DIR/frontend/.env" ]] && grep -q "^VITE_ZAPTEC_CLIENTES_MODE=" "$INSTALL_DIR/frontend/.env"; then
+    set_env_var "VITE_ZAPTEC_CLIENTES_MODE" "false" "$INSTALL_DIR/frontend/.env"
+    log "VITE_ZAPTEC_CLIENTES_MODE=false (frontend/.env)"
+  fi
+}
+
+configure_install_profile() {
+  case "$GITHUB_BRANCH" in
+    clientes) configure_clientes_profile ;;
+    main)     configure_hub_profile ;;
+    *)        info "Branch '$GITHUB_BRANCH': perfil de instalação não alterado" ;;
+  esac
+}
+
+INSTALL_PROFILE="$([ "$GITHUB_BRANCH" = "clientes" ] && echo "VM Cliente" || ([ "$GITHUB_BRANCH" = "main" ] && echo "Hub Central" || echo "$GITHUB_BRANCH"))"
+
 echo -e "${BOLD}${CYAN}"
 echo "  ╔══════════════════════════════════════════════╗"
 echo "  ║       ZapTec SaaS - Atualização do Sistema  ║"
-echo "  ║       Branch/Versão: $GITHUB_BRANCH              ║"
+echo "  ║       Branch: $GITHUB_BRANCH"
+echo "  ║       Perfil:  $INSTALL_PROFILE"
 echo "  ╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -261,6 +310,9 @@ fi
 # ─── Seed da Central de Ajuda ──────────────────────────────────
 section "Atualizando Central de Ajuda"
 npx tsx prisma/seed-help.ts 2>/dev/null && log "Artigos de ajuda atualizados" || warn "Seed de ajuda ignorado (não crítico)"
+
+# ─── Perfil Hub / VM Cliente (antes do build — Vite lê frontend/.env) ──
+configure_install_profile
 
 # ─── Build do frontend ─────────────────────────────────────────
 section "Compilando Frontend"

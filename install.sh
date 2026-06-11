@@ -1,9 +1,6 @@
 #!/bin/bash
 # =============================================================
-# ZapTec SaaS - Instalador completo para VPS  (v3.0)
-# PUBLICADO EM: https://github.com/morrice22/zaptec-install
-# FONTE CANONICA: whatsapp-saas/install.sh
-# Sincronizar: deploy/publish-zaptec-install.ps1 (Windows) ou .sh (Linux)
+# ZapTec SaaS - Instalador completo para VPS
 # Compativel com: Ubuntu 22.04+, Debian 12+, AlmaLinux 8+, Rocky Linux 8+
 #
 # INSTALAR (interativo):
