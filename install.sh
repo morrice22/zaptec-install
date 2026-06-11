@@ -95,8 +95,11 @@ detect_ticketz() {
   if [[ -n "$c" ]]; then
     HAS_TICKETZ=true
     TICKETZ_DIR=$(docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || echo "")
-    [[ -f "$TICKETZ_DIR/.env" ]] && TICKETZ_ENV="$TICKETZ_DIR/.env"
+    if [[ -f "$TICKETZ_DIR/.env" ]]; then
+      TICKETZ_ENV="$TICKETZ_DIR/.env"
+    fi
   fi
+  return 0
 }
 
 read_ticketz_db_credentials() {
@@ -337,7 +340,7 @@ fi
 
 log "Sistema detectado: $OS_ID $VERSION_ID ($OS_FAMILY)"
 
-detect_ticketz
+detect_ticketz || true
 if [[ "$HAS_TICKETZ" == true ]]; then
   info "Ticketz detectado — o instalador configurará o proxy para a aba de Migração"
 else
