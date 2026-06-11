@@ -41,6 +41,17 @@ echo -e "${NC}"
 [[ ! -d "$INSTALL_DIR" ]] && error "Instalação não encontrada em $INSTALL_DIR. Use install.sh primeiro."
 [[ ! -f "$INSTALL_DIR/.env" ]] && error "Arquivo .env não encontrado. A instalação pode estar incompleta."
 
+# Metadados da instalação (porta, certbot, ticketz)
+APP_PORT=3000
+USE_CERTBOT=yes
+HAS_TICKETZ=no
+if [[ -f "$INSTALL_DIR/.install-meta" ]]; then
+  # shellcheck disable=SC1090
+  source "$INSTALL_DIR/.install-meta" 2>/dev/null || true
+fi
+APP_PORT="${APP_PORT:-$(grep '^PORT=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r' || echo 3000)}"
+info "Porta backend: $APP_PORT | Certbot na VPS: ${USE_CERTBOT:-yes}"
+
 # ─── Verificar serviços dependentes ────────────────────────────
 section "Verificando Serviços"
 
@@ -123,8 +134,20 @@ git pull origin "$GITHUB_BRANCH" --ff-only
 NEW_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "desconhecido")
 log "Código atualizado: $CURRENT_COMMIT → $NEW_COMMIT"
 
-# Restaura o .env (nunca sobrescrever com pull)
-git checkout -- .env 2>/dev/null || true
+# Restaura o .env e metadados locais (nunca sobrescrever com pull)
+git checkout -- .env .install-meta 2>/dev/null || true
+
+# ─── Proxy Ticketz (se detectado na instalação) ───────────────
+if [[ "${HAS_TICKETZ:-no}" == "yes" && -f "$INSTALL_DIR/deploy/ticketz-proxy.js" ]]; then
+  if ! docker ps --format '{{.Names}}' | grep -q '^ticketz-mig-proxy$'; then
+    warn "Proxy Ticketz parado — tentando reiniciar..."
+    if docker ps -a --format '{{.Names}}' | grep -q '^ticketz-mig-proxy$'; then
+      docker start ticketz-mig-proxy 2>/dev/null && log "Proxy Ticketz reiniciado" || warn "Não foi possível reiniciar ticketz-mig-proxy"
+    fi
+  else
+    log "Proxy Ticketz: rodando"
+  fi
+fi
 
 # ─── Atualizar dependências do backend ────────────────────────
 section "Atualizando Dependências"
@@ -254,12 +277,57 @@ section "Compilando Backend"
 npm run build
 log "Backend compilado"
 
+# ─── Ajustes de estabilidade (idempotentes) ────────────────────
+section "Aplicando Ajustes de Estabilidade"
+
+# 1) PM2: subir limite de memória de 1G → 2G (instalações antigas).
+#    Com muitos tickets/conexões, 1G estoura e o PM2 fica reiniciando em loop.
+if [[ -f "$INSTALL_DIR/ecosystem.config.js" ]] && grep -q "max_memory_restart: '1G'" "$INSTALL_DIR/ecosystem.config.js"; then
+  sed -i "s/max_memory_restart: '1G'/max_memory_restart: '2G'/" "$INSTALL_DIR/ecosystem.config.js"
+  log "PM2 max_memory_restart ajustado para 2G"
+fi
+
+# 2) .env: garantir que o painel admin use 'restart' (não 'reload').
+#    reload roda dois processos com a mesma sessão Baileys → WhatsApp derruba a conexão.
+if ! grep -q "^PM2_RELOAD_COMMAND=" "$INSTALL_DIR/.env"; then
+  echo "PM2_RELOAD_COMMAND=pm2 restart zaptec-backend --update-env" >> "$INSTALL_DIR/.env"
+  log "PM2_RELOAD_COMMAND adicionado ao .env (restart, não reload)"
+fi
+
+# 3) .env: garantir flag de sync de histórico DESLIGADA por padrão.
+#    Quando ligada sem limites, dispara fetchMessageHistory para todos os tickets
+#    ao conectar e estoura memória/derruba a sessão (loop de crash/restart).
+if ! grep -q "^WHATSAPP_SYNC_HISTORY_ON_CONNECT=" "$INSTALL_DIR/.env"; then
+  {
+    echo "WHATSAPP_SYNC_HISTORY_ON_CONNECT=false"
+    echo "WHATSAPP_SYNC_HISTORY_MAX=20"
+    echo "WHATSAPP_SYNC_HISTORY_DELAY_MS=800"
+  } >> "$INSTALL_DIR/.env"
+  log "Flags WHATSAPP_SYNC_HISTORY_* adicionadas ao .env (sync em massa desligado)"
+fi
+
+# 4) .env: intervalo mínimo entre envios (evita rate-overlimit por rajada).
+if ! grep -q "^WHATSAPP_MIN_SEND_INTERVAL_MS=" "$INSTALL_DIR/.env"; then
+  echo "WHATSAPP_MIN_SEND_INTERVAL_MS=1000" >> "$INSTALL_DIR/.env"
+  log "WHATSAPP_MIN_SEND_INTERVAL_MS adicionado ao .env (throttle de envio)"
+fi
+
 # ─── Reiniciar aplicação via PM2 ───────────────────────────────
 section "Reiniciando Serviço"
 
 if pm2 list | grep -q "zaptec-backend"; then
-  pm2 reload zaptec-backend --update-env
-  log "Backend recarregado via PM2 (zero downtime)"
+  # restart (não reload) para evitar que dois processos rodem em paralelo com a mesma sessão Baileys.
+  # pm2 reload (zero-downtime) faz o processo novo iniciar antes do antigo parar → conflito de sessão
+  # → WhatsApp desconecta a sessão. Com restart, o antigo encerra (graceful shutdown preserva a sessão
+  # no disco) antes do novo iniciar → reconecta sem precisar escanear QR novamente.
+  # Reiniciar a partir do ecosystem.config.js para reler opções (ex.: max_memory_restart).
+  if [[ -f "$INSTALL_DIR/ecosystem.config.js" ]]; then
+    pm2 restart "$INSTALL_DIR/ecosystem.config.js" --update-env
+  else
+    pm2 restart zaptec-backend --update-env
+  fi
+  pm2 save
+  log "Backend reiniciado via PM2 (sessões Baileys preservadas)"
 else
   pm2 start ecosystem.config.js
   pm2 save
@@ -282,21 +350,22 @@ if [[ -n "${NEW_DOMAIN:-}" ]]; then
   else
     info "Domínio atual: $OLD_DOMAIN → novo: $NEW_DOMAIN"
 
-    # 1) Garantir que certbot está disponível
-    if ! command -v certbot &>/dev/null; then
-      warn "Certbot não encontrado, instalando..."
-      apt-get install -y -qq certbot python3-certbot-nginx 2>/dev/null \
-        || dnf install -y -q certbot python3-certbot-nginx 2>/dev/null \
-        || error "Não foi possível instalar o certbot. Instale manualmente e execute novamente."
-    fi
-
-    # 2) Resolver Nginx conf file
-    NGINX_CONF_NEW=$(find /etc/nginx/sites-available /etc/nginx/conf.d -name "*.conf" 2>/dev/null | head -1)
+    NGINX_CONF_NEW=$(find /etc/nginx/sites-available /etc/nginx/conf.d -name "zaptec*.conf" 2>/dev/null | head -1)
+    [[ -z "$NGINX_CONF_NEW" ]] && NGINX_CONF_NEW=$(find /etc/nginx/sites-available /etc/nginx/conf.d -name "*.conf" 2>/dev/null | head -1)
     [[ -z "$NGINX_CONF_NEW" ]] && NGINX_CONF_NEW="/etc/nginx/sites-available/zaptec"
 
-    # 3) Criar config HTTP temporária para o NOVO domínio (para emitir cert)
-    NGINX_TMP="/etc/nginx/sites-available/zaptec-newdomain"
-    cat > "$NGINX_TMP" <<NGINX_TMP_EOF
+    if [[ "${USE_CERTBOT:-yes}" == "yes" ]] && command -v nginx &>/dev/null; then
+      # 1) Garantir que certbot está disponível
+      if ! command -v certbot &>/dev/null; then
+        warn "Certbot não encontrado, instalando..."
+        apt-get install -y -qq certbot python3-certbot-nginx 2>/dev/null \
+          || dnf install -y -q certbot python3-certbot-nginx 2>/dev/null \
+          || error "Não foi possível instalar o certbot. Instale manualmente e execute novamente."
+      fi
+
+      # 2) Config HTTP temporária para emitir cert
+      NGINX_TMP="/etc/nginx/sites-available/zaptec-newdomain"
+      cat > "$NGINX_TMP" <<NGINX_TMP_EOF
 server {
     listen 80;
     server_name ${NEW_DOMAIN};
@@ -305,29 +374,30 @@ server {
 }
 NGINX_TMP_EOF
 
-    if [[ -d /etc/nginx/sites-enabled ]]; then
-      ln -sf "$NGINX_TMP" /etc/nginx/sites-enabled/zaptec-newdomain
+      if [[ -d /etc/nginx/sites-enabled ]]; then
+        ln -sf "$NGINX_TMP" /etc/nginx/sites-enabled/zaptec-newdomain
+      fi
+      nginx -t && systemctl reload nginx
+      log "Nginx temporário HTTP ativo para $NEW_DOMAIN"
+
+      LE_EMAIL_DOMAIN="${LE_EMAIL:-}"
+      if [[ -z "$LE_EMAIL_DOMAIN" ]]; then
+        LE_EMAIL_DOMAIN=$(certbot show_account 2>/dev/null | grep "Email" | awk '{print $2}' || echo "")
+      fi
+      [[ -z "$LE_EMAIL_DOMAIN" ]] && error "Defina LE_EMAIL=seu@email.com ao executar o script com NEW_DOMAIN"
+
+      certbot certonly --nginx -d "$NEW_DOMAIN" \
+        --email "$LE_EMAIL_DOMAIN" --agree-tos --non-interactive
+      log "Certificado SSL emitido para $NEW_DOMAIN"
+
+      rm -f "$NGINX_TMP"
+      [[ -L /etc/nginx/sites-enabled/zaptec-newdomain ]] && rm -f /etc/nginx/sites-enabled/zaptec-newdomain
+    else
+      info "Certbot desativado nesta instalação — apenas .env será atualizado (configure SSL no proxy reverso)"
     fi
-    nginx -t && systemctl reload nginx
-    log "Nginx temporário HTTP ativo para $NEW_DOMAIN"
 
-    # 4) Emitir certificado SSL para o novo domínio
-    LE_EMAIL_DOMAIN="${LE_EMAIL:-}"
-    if [[ -z "$LE_EMAIL_DOMAIN" ]]; then
-      # Tenta reutilizar o email já cadastrado no certbot
-      LE_EMAIL_DOMAIN=$(certbot show_account 2>/dev/null | grep "Email" | awk '{print $2}' || echo "")
-    fi
-    [[ -z "$LE_EMAIL_DOMAIN" ]] && error "Defina LE_EMAIL=seu@email.com ao executar o script com NEW_DOMAIN"
-
-    certbot certonly --nginx -d "$NEW_DOMAIN" \
-      --email "$LE_EMAIL_DOMAIN" --agree-tos --non-interactive
-    log "Certificado SSL emitido para $NEW_DOMAIN"
-
-    # 5) Remover config temporária
-    rm -f "$NGINX_TMP"
-    [[ -L /etc/nginx/sites-enabled/zaptec-newdomain ]] && rm -f /etc/nginx/sites-enabled/zaptec-newdomain
-
-    # 6) Reescrever config Nginx com novo domínio HTTPS + redirect do antigo
+    # Reescrever Nginx (somente se Certbot/nginx ativos nesta VPS)
+    if [[ "${USE_CERTBOT:-yes}" == "yes" ]] && command -v nginx &>/dev/null; then
     cat > "$NGINX_CONF_NEW" <<NGINXEOF
 # Redireciona domínio antigo para o novo (preserva POSTs com 308)
 server {
@@ -368,15 +438,20 @@ server {
     add_header X-Content-Type-Options nosniff;
     root ${INSTALL_DIR}/frontend/dist;
     index index.html;
+    location = /manifest.json {
+        proxy_pass http://127.0.0.1:${APP_PORT};
+        proxy_set_header Host \$host;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+    }
     location /api/ {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         client_max_body_size 50m;
     }
     location /socket.io/ {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -384,15 +459,15 @@ server {
         proxy_read_timeout 3600s;
     }
     location /media/ {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:${APP_PORT};
         client_max_body_size 50m;
     }
     location /uploads/ {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:${APP_PORT};
         client_max_body_size 20m;
     }
     location /webhooks/ {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_set_header Host \$host;
     }
     location / {
@@ -404,16 +479,20 @@ NGINXEOF
     if [[ -d /etc/nginx/sites-enabled ]]; then
       ln -sf "$NGINX_CONF_NEW" /etc/nginx/sites-enabled/zaptec
     fi
+    nginx -t && systemctl reload nginx
+    log "Nginx recarregado com config do novo domínio"
+    fi
 
-    # 7) Atualizar .env com o novo domínio
+    # Atualizar .env com o novo domínio
     sed -i "s|BACKEND_URL=https\?://${OLD_DOMAIN}|BACKEND_URL=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
     sed -i "s|FRONTEND_URL=https\?://${OLD_DOMAIN}|FRONTEND_URL=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
     sed -i "s|API_URL=https\?://${OLD_DOMAIN}|API_URL=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
     sed -i "s|CORS_ORIGIN=https\?://${OLD_DOMAIN}|CORS_ORIGIN=https://${NEW_DOMAIN}|g" "$INSTALL_DIR/.env"
     sed -i "s|GOOGLE_REDIRECT_URI=https\?://${OLD_DOMAIN}|GOOGLE_REDIRECT_URI=https://${NEW_DOMAIN}/api/backup/google/callback|g" "$INSTALL_DIR/.env"
+    [[ -f "$INSTALL_DIR/.install-meta" ]] && sed -i "s|^APP_DOMAIN=.*|APP_DOMAIN=${NEW_DOMAIN}|" "$INSTALL_DIR/.install-meta"
+    [[ -f "$INSTALL_DIR/.install-meta" ]] && sed -i "s|^PUBLIC_URL=.*|PUBLIC_URL=https://${NEW_DOMAIN}|" "$INSTALL_DIR/.install-meta"
     log ".env atualizado com novo domínio"
 
-    # 8) Atualizar notificameWebhookUrl no banco (conexões OFFICIAL)
     DB_URL=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
     DB_NAME=$(echo "$DB_URL" | sed -E 's|.*/([^?]+).*|\1|')
     DB_USER=$(echo "$DB_URL" | sed -E 's|.*://([^:]+):.*|\1|')
@@ -424,15 +503,15 @@ NGINXEOF
       \"UPDATE whatsapp_connections SET \\\"notificameWebhookUrl\\\" = REPLACE(\\\"notificameWebhookUrl\\\", 'https://${OLD_DOMAIN}', 'https://${NEW_DOMAIN}') WHERE \\\"notificameWebhookUrl\\\" LIKE '%${OLD_DOMAIN}%'; SELECT ROW_COUNT();\"" 2>/dev/null || echo "0")
     log "Banco atualizado: notificameWebhookUrl migrado ($ROWS conexões)"
 
-    nginx -t && systemctl reload nginx
-    log "Nginx recarregado com config do novo domínio"
-
     echo ""
-    echo -e "  ${YELLOW}${BOLD}⚠  AÇÃO MANUAL NECESSÁRIA após reiniciar o backend:${NC}"
-    echo -e "  ${BOLD}1.${NC} Abrir Conexões → desativar e reativar cada conexão OFFICIAL"
-    echo -e "     (isso re-registra o webhook na Notifica.me com a nova URL)"
-    echo -e "  ${BOLD}2.${NC} Atualizar webhook no painel da AbacatePay para:"
-    echo -e "     ${CYAN}https://${NEW_DOMAIN}/webhooks/abacatepay?webhookSecret=SEU_SECRET${NC}"
+    echo -e "  ${YELLOW}${BOLD}⚠  AÇÃO MANUAL após reiniciar o backend:${NC}"
+    if [[ "${USE_CERTBOT:-yes}" != "yes" ]]; then
+      echo -e "  ${BOLD}1.${NC} Atualizar o proxy reverso para o novo domínio ${NEW_DOMAIN}"
+      echo -e "  ${BOLD}2.${NC} Reativar conexões OFFICIAL (webhook Notifica.me)"
+    else
+      echo -e "  ${BOLD}1.${NC} Reativar conexões OFFICIAL (webhook Notifica.me)"
+    fi
+    echo -e "  ${BOLD}·${NC} Atualizar webhook AbacatePay: ${CYAN}https://${NEW_DOMAIN}/webhooks/abacatepay?webhookSecret=...${NC}"
     echo ""
   fi
 fi
@@ -443,11 +522,28 @@ if systemctl is-active --quiet nginx; then
   NGINX_CONF=$(find /etc/nginx/sites-enabled /etc/nginx/conf.d -name "*.conf" 2>/dev/null | head -1)
   if [[ -n "$NGINX_CONF" ]] && ! grep -q "location /uploads/" "$NGINX_CONF"; then
     warn "Adicionando location /uploads/ ao nginx (ausente na instalação anterior)..."
-    sed -i '/location \/media\/ {/i \    location \/uploads\/ {\n        proxy_pass http:\/\/127.0.0.1:3000;\n        client_max_body_size 20m;\n    }' "$NGINX_CONF"
+    sed -i "/location \/media\/ {/i \\    location /uploads/ {\\n        proxy_pass http://127.0.0.1:${APP_PORT};\\n        client_max_body_size 20m;\\n    }" "$NGINX_CONF"
     log "location /uploads/ adicionado ao nginx"
+  fi
+  if [[ -n "$NGINX_CONF" ]] && ! grep -q "location = /manifest.json" "$NGINX_CONF"; then
+    warn "Adicionando proxy /manifest.json ao nginx (manifest dinâmico)..."
+    sed -i "/location \/ {/i \\    location = /manifest.json {\\n        proxy_pass http://127.0.0.1:${APP_PORT};\\n        proxy_set_header Host \\\$host;\\n        add_header Cache-Control \"no-cache, no-store, must-revalidate\" always;\\n    }\\n" "$NGINX_CONF"
+    log "location /manifest.json adicionado ao nginx"
+  fi
+  # Corrigir instalações antigas que ainda apontam nginx para :3000 com porta customizada
+  if [[ -n "$NGINX_CONF" && "$APP_PORT" != "3000" ]] && grep -q "127.0.0.1:3000" "$NGINX_CONF"; then
+    sed -i "s|127.0.0.1:3000|127.0.0.1:${APP_PORT}|g" "$NGINX_CONF"
+    log "Nginx atualizado para porta ${APP_PORT}"
   fi
   nginx -t && systemctl reload nginx
   log "Nginx recarregado"
+fi
+
+# ─── Verificar chaves VAPID (push notifications) ──────────────
+if ! grep -q "^VAPID_PUBLIC_KEY=.\+" "$INSTALL_DIR/.env" 2>/dev/null; then
+  warn "VAPID_PUBLIC_KEY não está configurado no .env — push notifications estão desativadas."
+  info "Para ativar, gere as chaves com: node -e \"const w=require('web-push');const k=w.generateVAPIDKeys();console.log(k);\""
+  info "Depois adicione VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY e VAPID_EMAIL ao $INSTALL_DIR/.env"
 fi
 
 # ─── Limpeza de backups antigos (mantém 14) ───────────────────
