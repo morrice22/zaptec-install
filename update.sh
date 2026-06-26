@@ -201,7 +201,7 @@ fi
 # ─── Atualizar dependências do backend ────────────────────────
 section "Atualizando Dependências"
 
-npm ci --quiet
+npm ci --include=dev --quiet
 log "Dependências do backend atualizadas"
 
 # ─── Rodar migrations (SEGURO - apenas adiciona, nunca apaga dados) ─
@@ -318,7 +318,7 @@ configure_install_profile
 section "Compilando Frontend"
 
 cd "$INSTALL_DIR/frontend"
-npm ci --quiet
+npm ci --include=dev --quiet
 npm run build
 log "Frontend compilado"
 cd "$INSTALL_DIR"
