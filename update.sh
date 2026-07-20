@@ -5,12 +5,10 @@
 # Este script fica no repo PUBLICO: morrice22/zaptec-install
 #
 # COMO USAR na VPS:
-#
-# Hub central (branch main — padrão):
 #   curl -sSL https://raw.githubusercontent.com/morrice22/zaptec-install/main/update.sh | sudo bash
 #
-# VM cliente (branch clientes — consome ZapTec Hub):
-#   VERSION=clientes curl -sSL https://raw.githubusercontent.com/morrice22/zaptec-install/main/update.sh | sudo bash
+# Modo Hub vs Conector: configurado por empresa no Super Admin (Empresas → Integração),
+# não por branch nem variável de ambiente.
 #
 # Tag ou branch específica:
 #   VERSION=v2.1.0 curl -sSL .../update.sh | sudo bash
@@ -34,54 +32,10 @@ warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
 error()   { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 section() { echo -e "\n${BOLD}${CYAN}══ $1 ══${NC}"; }
 
-# Garante variável KEY=VALUE no arquivo (cria ou substitui linha existente).
-set_env_var() {
-  local key="$1" value="$2" file="$3"
-  if grep -q "^${key}=" "$file" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
-  else
-    echo "${key}=${value}" >> "$file"
-  fi
-}
-
-# Branch clientes → VM filha (credenciais Hub, sem signup Meta local).
-configure_clientes_profile() {
-  section "Perfil: VM Cliente (branch clientes)"
-  set_env_var "ZAPTEC_CLIENTES_MODE" "true" "$INSTALL_DIR/.env"
-  set_env_var "VITE_ZAPTEC_CLIENTES_MODE" "true" "$INSTALL_DIR/frontend/.env"
-  log "ZAPTEC_CLIENTES_MODE=true (.env)"
-  log "VITE_ZAPTEC_CLIENTES_MODE=true (frontend/.env)"
-  info "Conexões Cloud API/Instagram: use URL + API Key do Hub central"
-}
-
-# Branch main → Hub central (Meta direto, API Externa para VMs filhas).
-configure_hub_profile() {
-  section "Perfil: Hub Central (branch main)"
-  if grep -q "^ZAPTEC_CLIENTES_MODE=" "$INSTALL_DIR/.env" 2>/dev/null; then
-    set_env_var "ZAPTEC_CLIENTES_MODE" "false" "$INSTALL_DIR/.env"
-    log "ZAPTEC_CLIENTES_MODE=false (.env)"
-  fi
-  if [[ -f "$INSTALL_DIR/frontend/.env" ]] && grep -q "^VITE_ZAPTEC_CLIENTES_MODE=" "$INSTALL_DIR/frontend/.env"; then
-    set_env_var "VITE_ZAPTEC_CLIENTES_MODE" "false" "$INSTALL_DIR/frontend/.env"
-    log "VITE_ZAPTEC_CLIENTES_MODE=false (frontend/.env)"
-  fi
-}
-
-configure_install_profile() {
-  case "$GITHUB_BRANCH" in
-    clientes) configure_clientes_profile ;;
-    main)     configure_hub_profile ;;
-    *)        info "Branch '$GITHUB_BRANCH': perfil de instalação não alterado" ;;
-  esac
-}
-
-INSTALL_PROFILE="$([ "$GITHUB_BRANCH" = "clientes" ] && echo "VM Cliente" || ([ "$GITHUB_BRANCH" = "main" ] && echo "Hub Central" || echo "$GITHUB_BRANCH"))"
-
 echo -e "${BOLD}${CYAN}"
 echo "  ╔══════════════════════════════════════════════╗"
 echo "  ║       ZapTec SaaS - Atualização do Sistema  ║"
-echo "  ║       Branch: $GITHUB_BRANCH"
-echo "  ║       Perfil:  $INSTALL_PROFILE"
+echo "  ║       Branch/Versão: $GITHUB_BRANCH              ║"
 echo "  ╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -104,26 +58,24 @@ info "Porta backend: $APP_PORT | Certbot na VPS: ${USE_CERTBOT:-yes}"
 # ─── Verificar serviços dependentes ────────────────────────────
 section "Verificando Serviços"
 
-# Verifica container por nome (independente do arquivo compose usado na instalação)
-if docker ps --format '{{.Names}}' | grep -q "zaptec-db"; then
-  log "PostgreSQL: rodando"
-elif docker compose -f "$INSTALL_DIR/docker-compose.prod.yml" ps 2>/dev/null | grep -q "running\|Up"; then
+# PostgreSQL e Redis rodam nativos via systemd (não em Docker).
+if systemctl is-active --quiet postgresql; then
   log "PostgreSQL: rodando"
 else
-  # Tenta iniciar o container se ele existir mas estiver parado
-  if docker ps -a --format '{{.Names}}' | grep -q "zaptec-db"; then
-    warn "PostgreSQL parado, iniciando..."
-    if [ -f "$INSTALL_DIR/docker-compose.prod.yml" ]; then
-      docker compose -f "$INSTALL_DIR/docker-compose.prod.yml" up -d
-    else
-      docker compose -f "$INSTALL_DIR/docker-compose.yml" up -d
-    fi
-    sleep 5
-    docker ps --format '{{.Names}}' | grep -q "zaptec-db" || error "PostgreSQL não iniciou. Verifique com: docker ps -a"
-    log "PostgreSQL: iniciado"
-  else
-    error "PostgreSQL não está rodando! Execute: cd $INSTALL_DIR && docker compose up -d"
-  fi
+  warn "PostgreSQL parado, iniciando..."
+  systemctl start postgresql
+  sleep 2
+  systemctl is-active --quiet postgresql || error "PostgreSQL não iniciou. Verifique com: systemctl status postgresql"
+  log "PostgreSQL: iniciado"
+fi
+
+REDIS_UNIT="redis-server"
+systemctl list-unit-files "redis-server.service" &>/dev/null || REDIS_UNIT="redis"
+if systemctl is-active --quiet "$REDIS_UNIT"; then
+  log "Redis: rodando"
+else
+  warn "Redis parado, iniciando..."
+  systemctl start "$REDIS_UNIT" || true
 fi
 
 if command -v pm2 &>/dev/null; then
@@ -145,13 +97,13 @@ DB_URL=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
 DB_NAME=$(echo "$DB_URL" | sed -E 's|.*/([^?]+).*|\1|')
 DB_USER=$(echo "$DB_URL" | sed -E 's|.*://([^:]+):.*|\1|')
 DB_PASS=$(echo "$DB_URL" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
+DB_HOST=$(echo "$DB_URL" | sed -E 's|.*://[^@]+@([^:/]+).*|\1|')
+DB_PORT=$(echo "$DB_URL" | sed -E 's|.*://[^@]+@[^:/]+:([0-9]+).*|\1|')
+[[ -z "$DB_PORT" ]] && DB_PORT=5432
 
 BACKUP_FILE="$BACKUP_DIR/pre_update_${DATE}.sql.gz"
 
-# Usa pg_dump de DENTRO do container Docker para evitar incompatibilidade de versão
-docker exec zaptec-db \
-  sh -c "PGPASSWORD='${DB_PASS}' pg_dump -U '${DB_USER}' '${DB_NAME}'" \
-  | gzip > "$BACKUP_FILE"
+PGPASSWORD="${DB_PASS}" pg_dump -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" "${DB_NAME}" | gzip > "$BACKUP_FILE"
 
 BACKUP_SIZE=$(du -sh "$BACKUP_FILE" | cut -f1)
 log "Backup criado: pre_update_${DATE}.sql.gz ($BACKUP_SIZE)"
@@ -201,7 +153,7 @@ fi
 # ─── Atualizar dependências do backend ────────────────────────
 section "Atualizando Dependências"
 
-npm ci --include=dev --quiet
+npm ci --include=dev --quiet  # --include=dev: garante tsc/vite mesmo com NODE_ENV=production (update via painel)
 log "Dependências do backend atualizadas"
 
 # ─── Rodar migrations (SEGURO - apenas adiciona, nunca apaga dados) ─
@@ -216,15 +168,17 @@ npx prisma generate
 # pois o Prisma roda cada migration em transação — se falhar, nada foi
 # realmente persistido e podemos seguramente marcar como revertida.
 auto_resolve_failed_migrations() {
-  local DB_URL_LOCAL DB_NAME_LOCAL DB_USER_LOCAL DB_PASS_LOCAL FAILED_LIST
+  local DB_URL_LOCAL DB_NAME_LOCAL DB_USER_LOCAL DB_PASS_LOCAL DB_HOST_LOCAL DB_PORT_LOCAL FAILED_LIST
   DB_URL_LOCAL=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
   DB_NAME_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*/([^?]+).*|\1|')
   DB_USER_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*://([^:]+):.*|\1|')
   DB_PASS_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
+  DB_HOST_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*://[^@]+@([^:/]+).*|\1|')
+  DB_PORT_LOCAL=$(echo "$DB_URL_LOCAL" | sed -E 's|.*://[^@]+@[^:/]+:([0-9]+).*|\1|')
+  [[ -z "$DB_PORT_LOCAL" ]] && DB_PORT_LOCAL=5432
 
-  FAILED_LIST=$(docker exec zaptec-db sh -c \
-    "PGPASSWORD='${DB_PASS_LOCAL}' psql -U '${DB_USER_LOCAL}' '${DB_NAME_LOCAL}' -tAc \
-    \"SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NULL AND rolled_back_at IS NULL;\"" 2>/dev/null \
+  FAILED_LIST=$(PGPASSWORD="${DB_PASS_LOCAL}" psql -h "${DB_HOST_LOCAL}" -p "${DB_PORT_LOCAL}" -U "${DB_USER_LOCAL}" "${DB_NAME_LOCAL}" -tAc \
+    "SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NULL AND rolled_back_at IS NULL;" 2>/dev/null \
     | tr -d '\r' | grep -v '^$' || true)
 
   if [[ -z "$FAILED_LIST" ]]; then
@@ -307,18 +261,152 @@ SQL
   fi
 fi
 
+# ─── Corrigir mídias migradas (Ticketz / URLs legadas) ─────────
+section "Corrigindo Mídias Migradas"
+
+fix_migrated_media() {
+  local DB_URL_FIX DB_NAME_FIX DB_USER_FIX DB_PASS_FIX DB_HOST_FIX DB_PORT_FIX FIX_SQL FIX_OUT
+  DB_URL_FIX=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
+  DB_NAME_FIX=$(echo "$DB_URL_FIX" | sed -E 's|.*/([^?]+).*|\1|')
+  DB_USER_FIX=$(echo "$DB_URL_FIX" | sed -E 's|.*://([^:]+):.*|\1|')
+  DB_PASS_FIX=$(echo "$DB_URL_FIX" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
+  DB_HOST_FIX=$(echo "$DB_URL_FIX" | sed -E 's|.*://[^@]+@([^:/]+).*|\1|')
+  DB_PORT_FIX=$(echo "$DB_URL_FIX" | sed -E 's|.*://[^@]+@[^:/]+:([0-9]+).*|\1|')
+  [[ -z "$DB_PORT_FIX" ]] && DB_PORT_FIX=5432
+
+  FIX_SQL="/tmp/zaptec_media_fix_$$.sql"
+  cat > "$FIX_SQL" <<'SQL'
+-- URLs absolutas (IP/domínio antigo) → caminho relativo /media/...
+UPDATE "messages"
+   SET "mediaUrl" = regexp_replace("mediaUrl", '^https?://[^/]+', '')
+ WHERE "mediaUrl" ~ '^https?://'
+   AND ("mediaUrl" LIKE '%/media/%' OR "mediaUrl" LIKE '%/api/media/%');
+
+UPDATE "messages"
+   SET "mediaUrl" = regexp_replace("mediaUrl", '^/api/media/', '/media/')
+ WHERE "mediaUrl" LIKE '/api/media/%';
+
+-- Migração Ticketz: mediaUrl preenchido mas type=TEXT — infere pela extensão
+UPDATE "messages" SET type = 'DOCUMENT'::"MessageType"
+ WHERE "mediaUrl" IS NOT NULL AND type = 'TEXT'::"MessageType"
+   AND "mediaUrl" ~* '\.(pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|csv|txt|xml|odt|ods)(\?|$)';
+
+UPDATE "messages" SET type = 'IMAGE'::"MessageType"
+ WHERE "mediaUrl" IS NOT NULL AND type = 'TEXT'::"MessageType"
+   AND "mediaUrl" ~* '\.(jpe?g|png|gif|webp|bmp|svg|heic|heif)(\?|$)';
+
+UPDATE "messages" SET type = 'VIDEO'::"MessageType"
+ WHERE "mediaUrl" IS NOT NULL AND type = 'TEXT'::"MessageType"
+   AND "mediaUrl" ~* '\.(mp4|webm|mov|avi|mkv|3gp)(\?|$)';
+
+UPDATE "messages" SET type = 'AUDIO'::"MessageType"
+ WHERE "mediaUrl" IS NOT NULL AND type = 'TEXT'::"MessageType"
+   AND "mediaUrl" ~* '\.(ogg|mp3|wav|aac|m4a|opus|weba)(\?|$)';
+
+-- Placeholders legados no body (ex.: [application/pdf]) quando já há mídia
+UPDATE "messages"
+   SET body = ''
+ WHERE "mediaUrl" IS NOT NULL
+   AND type <> 'TEXT'::"MessageType"
+   AND trim(body) ~ '^\[[^\]]+\]$'
+   AND length(trim(body)) < 40;
+
+-- Tickets migrados sem prévia: a migração não preencheu lastMessage, então a
+-- lista mostrava "Sem mensagens" mesmo havendo mensagens. Backfill da ÚLTIMA
+-- mensagem de cada ticket. Idempotente: só preenche o que está vazio.
+UPDATE "tickets" t SET
+  "lastMessage" = COALESCE(
+    NULLIF(lm.body, ''),
+    CASE lm.type::text
+      WHEN 'IMAGE'    THEN '[IMAGE]'
+      WHEN 'VIDEO'    THEN '[VIDEO]'
+      WHEN 'AUDIO'    THEN '[AUDIO]'
+      WHEN 'DOCUMENT' THEN '[DOCUMENT]'
+      WHEN 'STICKER'  THEN '[STICKER]'
+      WHEN 'LOCATION' THEN '[LOCATION]'
+      WHEN 'VCARD'    THEN '[Contato]'
+      ELSE ''
+    END
+  ),
+  "lastMessageFromMe" = lm."isFromMe"
+  -- NÃO mexer em lastMessageAt: ele mede OCIOSIDADE (auto-close por timeout).
+  -- Preencher com a data histórica da migração faria o ticket parecer ocioso há
+  -- meses e o scheduler o fecharia automaticamente. Aqui é só prévia de texto.
+FROM (
+  SELECT DISTINCT ON ("ticketId") "ticketId", body, type, "createdAt", "isFromMe"
+    FROM "messages"
+   -- Ignora mensagens sem prévia (body vazio E não-mídia) para não gravar '' como
+   -- lastMessage quando a ÚLTIMA mensagem do ticket é vazia (sistema/ack).
+   WHERE btrim(COALESCE(body, '')) <> '' OR type::text <> 'TEXT'
+   ORDER BY "ticketId", "createdAt" DESC
+) lm
+WHERE t.id = lm."ticketId"
+  AND (t."lastMessage" IS NULL OR t."lastMessage" = '');
+
+-- Tickets AINDA vazios (sem mensagens próprias — ex.: campanha/reabertura criou
+-- o ticket vazio e o template foi enviado em sessão anterior): herdam a última
+-- mensagem do histórico do MESMO contato. Assim a lista mostra a prévia real.
+UPDATE "tickets" t SET
+  "lastMessage" = COALESCE(
+    NULLIF(lm.body, ''),
+    CASE lm.type::text
+      WHEN 'IMAGE'    THEN '[IMAGE]'
+      WHEN 'VIDEO'    THEN '[VIDEO]'
+      WHEN 'AUDIO'    THEN '[AUDIO]'
+      WHEN 'DOCUMENT' THEN '[DOCUMENT]'
+      WHEN 'STICKER'  THEN '[STICKER]'
+      WHEN 'LOCATION' THEN '[LOCATION]'
+      WHEN 'VCARD'    THEN '[Contato]'
+      ELSE ''
+    END
+  ),
+  "lastMessageFromMe" = lm."isFromMe"
+  -- NÃO mexer em lastMessageAt: ele mede OCIOSIDADE (auto-close por timeout).
+  -- Preencher com a data histórica da migração faria o ticket parecer ocioso há
+  -- meses e o scheduler o fecharia automaticamente. Aqui é só prévia de texto.
+FROM (
+  SELECT DISTINCT ON (tk."contactId") tk."contactId", m.body, m.type, m."createdAt", m."isFromMe"
+    FROM "messages" m
+    JOIN "tickets" tk ON tk.id = m."ticketId"
+   WHERE btrim(COALESCE(m.body, '')) <> '' OR m.type::text <> 'TEXT'
+   ORDER BY tk."contactId", m."createdAt" DESC
+) lm
+WHERE t."contactId" = lm."contactId"
+  AND (t."lastMessage" IS NULL OR t."lastMessage" = '')
+  -- Só herda de tickets anteriores se a empresa permite ver conversas anteriores
+  -- (default = true quando não há configuração). Respeita a permissão da empresa.
+  AND COALESCE(
+        (SELECT cs."showPreviousConversations" FROM company_settings cs WHERE cs."companyId" = t."companyId"),
+        true
+      ) = true;
+SQL
+
+  FIX_OUT=$(PGPASSWORD="${DB_PASS_FIX}" psql -h "${DB_HOST_FIX}" -p "${DB_PORT_FIX}" -U "${DB_USER_FIX}" "${DB_NAME_FIX}" -v ON_ERROR_STOP=1 -f "$FIX_SQL" 2>&1) || {
+    rm -f "$FIX_SQL"
+    warn "Correção de mídias migradas falhou (não crítico — veja logs abaixo)"
+    echo "$FIX_OUT" | tail -20
+    return 0
+  }
+  rm -f "$FIX_SQL"
+
+  local FIXED_TYPES
+  FIXED_TYPES=$(PGPASSWORD="${DB_PASS_FIX}" psql -h "${DB_HOST_FIX}" -p "${DB_PORT_FIX}" -U "${DB_USER_FIX}" "${DB_NAME_FIX}" -tAc \
+    "SELECT COUNT(*) FROM messages WHERE \"mediaUrl\" IS NOT NULL AND type <> 'TEXT'::\"MessageType\";" 2>/dev/null \
+    | tr -d '\r' || echo "?")
+  log "Mídias migradas corrigidas (mensagens com tipo de mídia: ${FIXED_TYPES})"
+}
+
+fix_migrated_media
+
 # ─── Seed da Central de Ajuda ──────────────────────────────────
 section "Atualizando Central de Ajuda"
 npx tsx prisma/seed-help.ts 2>/dev/null && log "Artigos de ajuda atualizados" || warn "Seed de ajuda ignorado (não crítico)"
-
-# ─── Perfil Hub / VM Cliente (antes do build — Vite lê frontend/.env) ──
-configure_install_profile
 
 # ─── Build do frontend ─────────────────────────────────────────
 section "Compilando Frontend"
 
 cd "$INSTALL_DIR/frontend"
-npm ci --include=dev --quiet
+npm ci --include=dev --quiet  # --include=dev: garante tsc/vite mesmo com NODE_ENV=production (update via painel)
 npm run build
 log "Frontend compilado"
 cd "$INSTALL_DIR"
@@ -328,6 +416,106 @@ section "Compilando Backend"
 
 npm run build
 log "Backend compilado"
+
+# ─── Sync Ticketz pós-update (automático se TICKETZ_SYNC_PAIRS no .env) ──
+run_ticketz_auto_sync() {
+  [[ "${HAS_TICKETZ:-no}" != "yes" ]] && return 0
+
+  local pairs proxy_url proxy_token db_url
+  pairs=$(grep '^TICKETZ_SYNC_PAIRS=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)
+  if [[ -z "$pairs" ]]; then
+    info "Ticketz detectado — configure TICKETZ_SYNC_PAIRS no .env para sync automático (ex: 2:uuid-da-empresa-zaptec)"
+    return 0
+  fi
+
+  proxy_url=$(grep '^TICKETZ_PROXY_URL=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)
+  proxy_token=$(grep '^TICKETZ_PROXY_TOKEN=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)
+  db_url=$(grep '^DATABASE_URL=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)
+
+  if [[ -z "$proxy_url" || -z "$db_url" ]]; then
+    warn "Ticketz sync: TICKETZ_PROXY_URL ou DATABASE_URL ausente — pulando"
+    return 0
+  fi
+
+  section "Sincronizando Ticketz (automático)"
+
+  local pair src dst sync_ok sync_fail
+  sync_ok=0
+  sync_fail=0
+  IFS=',' read -ra PAIR_LIST <<< "$pairs"
+  for pair in "${PAIR_LIST[@]}"; do
+    pair="${pair// /}"
+    [[ -z "$pair" ]] && continue
+    src="${pair%%:*}"
+    dst="${pair#*:}"
+    if [[ -z "$src" || -z "$dst" || "$src" == "$pair" ]]; then
+      warn "TICKETZ_SYNC_PAIRS: par inválido '$pair' (use ticketzId:zaptecUuid)"
+      continue
+    fi
+    info "Ticketz #$src → ZapTec $dst"
+    sync_out=""
+    sync_out=$(TICKETZ_OP=sync-all \
+      TICKETZ_PROXY_URL="$proxy_url" \
+      TICKETZ_PROXY_TOKEN="${proxy_token:-zaptec-mig-2026}" \
+      ZAPTEC_URL="$db_url" \
+      SRC_COMPANY_ID="$src" \
+      DST_COMPANY_ID="$dst" \
+      node "$INSTALL_DIR/dist/modules/migration/ticketz.worker.js" 2>&1) || true
+    if echo "$sync_out" | grep -q '"done":true'; then
+      log "Sync OK: Ticketz #$src"
+      sync_ok=$((sync_ok + 1))
+    else
+      warn "Sync falhou para Ticketz #$src (não crítico)"
+      echo "$sync_out" | tail -5
+      sync_fail=$((sync_fail + 1))
+    fi
+  done
+
+  if [[ "$sync_ok" -gt 0 ]]; then
+    log "Ticketz: $sync_ok par(es) sincronizado(s) (config + filas + métricas)"
+  fi
+  [[ "$sync_fail" -gt 0 ]] && warn "Ticketz: $sync_fail par(es) com falha"
+
+  # Fallback: tickets com acceptedAt+closedAt mas sem activeHandleSeconds (pós-sync Ticketz)
+  if [[ "$sync_ok" -gt 0 && -n "$db_url" ]]; then
+    PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" "${DB_NAME}" -c "
+      UPDATE tickets SET \"activeHandleSeconds\" = GREATEST(0, EXTRACT(EPOCH FROM (\"closedAt\" - \"acceptedAt\"))::int)
+      WHERE \"activeHandleSeconds\" = 0
+        AND \"acceptedAt\" IS NOT NULL AND \"closedAt\" IS NOT NULL
+        AND \"isGroup\" = false;
+    " 2>/dev/null && log "TMA: fallback acceptedAt→closedAt aplicado onde faltava" || true
+  fi
+}
+
+run_ticketz_auto_sync
+
+# ─── Scripts de backup/restauração (atualiza nas instalações existentes) ──
+if [[ -f "$INSTALL_DIR/deploy/zaptec-backup.sh" && -f "$INSTALL_DIR/deploy/zaptec-restore.sh" ]]; then
+  install -m 755 "$INSTALL_DIR/deploy/zaptec-backup.sh"  /usr/local/bin/zaptec-backup  2>/dev/null || true
+  install -m 755 "$INSTALL_DIR/deploy/zaptec-restore.sh" /usr/local/bin/zaptec-restore 2>/dev/null || true
+  log "Comandos zaptec-backup / zaptec-restore atualizados"
+
+  # Instalações antigas tinham o cron chamando zaptec-backup SEM --with-media
+  # (o script embutido no install.sh de então nem tinha essa opção) — corrige
+  # (ou cria, se não existir) aqui pra que o backup diário inclua mídia sem
+  # precisar reinstalar do zero. Idempotente.
+  if ! crontab -l 2>/dev/null | grep -q '/usr/local/bin/zaptec-backup --with-media'; then
+    (crontab -l 2>/dev/null | grep -v '/usr/local/bin/zaptec-backup'; \
+     echo "0 2 * * * /usr/local/bin/zaptec-backup --with-media >> /var/log/zaptec/backup.log 2>&1") | crontab -
+    log "Cron de backup configurado para incluir mídia (--with-media)"
+  fi
+fi
+
+# ─── Evolution API (WhatsApp não-oficial) ──────────────────────
+section "Configurando Evolution API"
+if [[ -f "$INSTALL_DIR/deploy/evolution/setup-evolution.sh" ]]; then
+  # Idempotente: segredos, versão WA no .env, build da imagem se faltar.
+  # Se a Evolution já está saudável, NÃO executa docker compose up -d (preserva conexões).
+  # Forçar recreate: EVOLUTION_FORCE_SETUP=1 bash update.sh
+  INSTALL_DIR="$INSTALL_DIR" bash "$INSTALL_DIR/deploy/evolution/setup-evolution.sh" || warn "Setup da Evolution retornou aviso (não crítico)"
+else
+  info "Script da Evolution não encontrado nesta versão do repo — pulando."
+fi
 
 # ─── Ajustes de estabilidade (idempotentes) ────────────────────
 section "Aplicando Ajustes de Estabilidade"
@@ -379,7 +567,11 @@ if pm2 list | grep -q "zaptec-backend"; then
     pm2 restart zaptec-backend --update-env
   fi
   pm2 save
-  log "Backend reiniciado via PM2 (sessões Baileys preservadas)"
+  if grep -q "^EVOLUTION_API_URL=" "$INSTALL_DIR/.env" 2>/dev/null; then
+    log "Backend reiniciado via PM2 (sessões WhatsApp ficam na Evolution — não são afetadas)"
+  else
+    log "Backend reiniciado via PM2 (sessões Baileys locais preservadas no disco)"
+  fi
 else
   pm2 start ecosystem.config.js
   pm2 save
@@ -549,10 +741,12 @@ NGINXEOF
     DB_NAME=$(echo "$DB_URL" | sed -E 's|.*/([^?]+).*|\1|')
     DB_USER=$(echo "$DB_URL" | sed -E 's|.*://([^:]+):.*|\1|')
     DB_PASS=$(echo "$DB_URL" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
+    DB_HOST=$(echo "$DB_URL" | sed -E 's|.*://[^@]+@([^:/]+).*|\1|')
+    DB_PORT=$(echo "$DB_URL" | sed -E 's|.*://[^@]+@[^:/]+:([0-9]+).*|\1|')
+    [[ -z "$DB_PORT" ]] && DB_PORT=5432
 
-    ROWS=$(docker exec zaptec-db sh -c \
-      "PGPASSWORD='${DB_PASS}' psql -U '${DB_USER}' '${DB_NAME}' -t -c \
-      \"UPDATE whatsapp_connections SET \\\"notificameWebhookUrl\\\" = REPLACE(\\\"notificameWebhookUrl\\\", 'https://${OLD_DOMAIN}', 'https://${NEW_DOMAIN}') WHERE \\\"notificameWebhookUrl\\\" LIKE '%${OLD_DOMAIN}%'; SELECT ROW_COUNT();\"" 2>/dev/null || echo "0")
+    ROWS=$(PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" "${DB_NAME}" -t -c \
+      "UPDATE whatsapp_connections SET \"notificameWebhookUrl\" = REPLACE(\"notificameWebhookUrl\", 'https://${OLD_DOMAIN}', 'https://${NEW_DOMAIN}') WHERE \"notificameWebhookUrl\" LIKE '%${OLD_DOMAIN}%'; SELECT ROW_COUNT();" 2>/dev/null || echo "0")
     log "Banco atualizado: notificameWebhookUrl migrado ($ROWS conexões)"
 
     echo ""
@@ -614,5 +808,5 @@ echo -e "  ${BOLD}PM2 status:${NC}      pm2 status"
 echo -e "  ${BOLD}Logs:${NC}            pm2 logs zaptec-backend"
 echo ""
 echo -e "${YELLOW}Se algo der errado, restaure com:${NC}"
-echo -e "  ${BOLD}zcat $BACKUP_FILE | docker exec -i zaptec-db sh -c \"PGPASSWORD='\$POSTGRES_PASSWORD' psql -U '\$POSTGRES_USER' '\$POSTGRES_DB'\"${NC}"
+echo -e "  ${BOLD}zaptec-restore $BACKUP_FILE${NC}"
 echo ""

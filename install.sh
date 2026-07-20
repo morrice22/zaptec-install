@@ -38,6 +38,35 @@ warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
 error()   { echo -e "${RED}[x]${NC} $1"; exit 1; }
 section() { echo -e "\n${BOLD}${CYAN}==> $1${NC}"; }
 
+# Executa um comando LONGO (que roda em silêncio) mostrando um spinner animado,
+# para o instalador não parecer travado. Em erro, mostra as últimas linhas do log.
+#   Uso: run_step "Descrição" comando arg1 arg2 ...
+run_step() {
+  local desc="$1"; shift
+  local logfile; logfile="$(mktemp 2>/dev/null || echo /tmp/zaptec-step.$$)"
+  local tty=""; { : >/dev/tty; } 2>/dev/null && tty="/dev/tty"
+  [[ -z "$tty" ]] && printf "  [ ] %s ...\n" "$desc"
+  "$@" >"$logfile" 2>&1 &
+  local pid=$!
+  if [[ -n "$tty" ]]; then
+    local frames='|/-\' i=0
+    while kill -0 "$pid" 2>/dev/null; do
+      printf "\r  ${CYAN}[%s]${NC} %s " "${frames:$((i%4)):1}" "$desc" >"$tty"
+      i=$((i+1)); sleep 0.2
+    done
+  fi
+  if wait "$pid"; then
+    if [[ -n "$tty" ]]; then printf "\r  ${GREEN}[+]${NC} %s        \n" "$desc" >"$tty"; else printf "  [+] %s\n" "$desc"; fi
+    rm -f "$logfile"
+  else
+    if [[ -n "$tty" ]]; then printf "\r  ${RED}[x]${NC} %s        \n" "$desc" >"$tty"; else printf "  [x] %s\n" "$desc"; fi
+    echo -e "${RED}  --- últimas linhas do erro ---${NC}" >&2
+    tail -n 25 "$logfile" >&2
+    rm -f "$logfile"
+    exit 1
+  fi
+}
+
 ask() {
   local var="$1" prompt="$2" default="${3:-}"
   if [[ -n "${!var:-}" ]]; then return; fi
@@ -236,6 +265,7 @@ server {
         proxy_pass http://127.0.0.1:${port};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         client_max_body_size 50m;
     }
@@ -280,6 +310,7 @@ server {
         proxy_pass http://127.0.0.1:${port};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         client_max_body_size 50m;
     }
@@ -324,8 +355,9 @@ section "Verificacoes"
 [[ $(uname -m) != "x86_64" ]] && error "Apenas x86_64 suportado."
 
 . /etc/os-release
-OS_ID="$ID"
-OS_VER="${VERSION_ID%%.*}"
+OS_ID="${ID:-}"
+# VERSION_ID pode não existir (ex.: Debian testing/sid); com `set -u` isso abortaria.
+OS_VER="${VERSION_ID:-0}"; OS_VER="${OS_VER%%.*}"
 
 if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
   OS_FAMILY="debian"
@@ -335,7 +367,7 @@ else
   error "Sistema nao suportado: $OS_ID. Use: Ubuntu, Debian, AlmaLinux, Rocky Linux ou RHEL."
 fi
 
-log "Sistema detectado: $OS_ID $VERSION_ID ($OS_FAMILY)"
+log "Sistema detectado: $OS_ID ${VERSION_ID:-?} ($OS_FAMILY)"
 
 detect_ticketz || true
 if [[ "$HAS_TICKETZ" == true ]]; then
@@ -417,40 +449,20 @@ fi
 
 if [[ "$OS_FAMILY" == "debian" ]]; then
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get upgrade -y -qq
-  apt-get install -y -qq curl wget git openssl ca-certificates gnupg lsb-release \
-    ufw fail2ban postgresql-client $PKG_NGINX $PKG_CERTBOT
+  run_step "Atualizando índice de pacotes (apt update)" apt-get update -qq
+  run_step "Atualizando o sistema (apt upgrade)" apt-get upgrade -y -qq
+  run_step "Instalando dependências base do sistema" apt-get install -y -qq curl wget git openssl ca-certificates gnupg lsb-release ufw fail2ban postgresql postgresql-contrib redis-server $PKG_NGINX $PKG_CERTBOT
 else
   rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux 2>/dev/null || \
   rpm --import https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux 2>/dev/null || true
   dnf upgrade -y -q --nogpgcheck 2>/dev/null || dnf upgrade -y -q || true
   dnf install -y -q epel-release
-  dnf install -y -q curl wget git openssl ca-certificates gnupg2 \
-    firewalld fail2ban postgresql $PKG_NGINX $PKG_CERTBOT
+  # --allowerasing: EL9 traz "curl-minimal" pré-instalado, que conflita com o
+  # pacote "curl" completo — deixa o dnf trocar um pelo outro em vez de falhar.
+  dnf install -y -q --allowerasing curl wget git openssl ca-certificates gnupg2 \
+    firewalld fail2ban postgresql-server postgresql-contrib redis $PKG_NGINX $PKG_CERTBOT
 fi
 log "Sistema atualizado"
-
-# -------------------------------------------------------------
-section "Instalando Docker"
-# -------------------------------------------------------------
-if command -v docker &>/dev/null; then
-  log "Docker ja instalado: $(docker --version)"
-else
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/$OS_ID/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS_ID $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  else
-    dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-    dnf install -y -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  fi
-  systemctl enable docker --now
-  log "Docker instalado: $(docker --version)"
-fi
 
 # -------------------------------------------------------------
 section "Instalando Node.js 20 LTS e PM2"
@@ -459,14 +471,15 @@ NODE_VER=0; command -v node &>/dev/null && NODE_VER=$(node -v | cut -d. -f1 | tr
 if [[ $NODE_VER -lt 20 ]]; then
   if [[ "$OS_FAMILY" == "debian" ]]; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-    apt-get install -y -qq nodejs
+    run_step "Instalando o Node.js 20 LTS" apt-get install -y -qq nodejs
   else
     curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-    dnf install -y -q nodejs
+    run_step "Instalando o Node.js 20 LTS" dnf install -y -q nodejs
   fi
 fi
 log "Node.js: $(node -v)"
-npm install -g pm2 --quiet && log "PM2: $(pm2 --version)"
+run_step "Instalando o PM2" npm install -g pm2
+log "PM2: $(pm2 --version)"
 
 # -------------------------------------------------------------
 section "Clonando Repositorio"
@@ -516,10 +529,12 @@ ENVEOF
 if [[ -n "${TICKETZ_PROXY_URL:-}" ]]; then
   cat >> "$INSTALL_DIR/.env" <<ENVEOF
 
-# Migração Ticketz (aba SUPER_ADMIN → Migração)
+# Migração Ticketz (aba SUPER_ADMIN → Migração; edite também em Configurações → Sistema → .env)
 TICKETZ_PROXY_URL=${TICKETZ_PROXY_URL}
 TICKETZ_PROXY_TOKEN=${TICKETZ_PROXY_TOKEN}
 TICKETZ_MEDIA_BASE_URL=${TICKETZ_MEDIA_BASE_URL}
+MIG_MSG_BATCH_SIZE=2000
+MIG_MSG_INSERT_CHUNK=500
 ENVEOF
 fi
 
@@ -538,45 +553,58 @@ METAEOF
 chmod 600 "$INSTALL_DIR/.install-meta"
 
 # -------------------------------------------------------------
-section "Iniciando PostgreSQL e Redis"
+section "Configurando PostgreSQL e Redis (nativos)"
 # -------------------------------------------------------------
-docker stop zaptec-db zaptec-redis 2>/dev/null || true
-docker rm   zaptec-db zaptec-redis 2>/dev/null || true
-rm -rf /opt/zaptec-data/postgres
-mkdir -p /opt/zaptec-data/postgres /opt/zaptec-data/redis
+# Postgres/Redis rodam nativos via systemd, NAO em Docker: um container pode
+# ser removido/recriado e abandonar o volume de dados sem ninguem perceber
+# (foi exatamente isso que causou perda de acesso ao banco em producao). Porta
+# 5433 (nao a 5432 padrao) para nao colidir com um Postgres de Ticketz que
+# porventura ja rode em Docker no mesmo host.
+if [[ "$OS_FAMILY" == "debian" ]]; then
+  PG_VER=$(ls /etc/postgresql/ 2>/dev/null | sort -Vr | head -1)
+  [[ -z "$PG_VER" ]] && error "Não encontrei a versão instalada do PostgreSQL em /etc/postgresql/"
+  pg_conftool "$PG_VER" main set port 5433
+  # Força scram-sha-256 explicitamente (não depender do default de cada versão
+  # do pacote): senão o hash da senha e o método exigido no pg_hba podem não
+  # bater e a autenticação falha mesmo com a senha certa.
+  pg_conftool "$PG_VER" main set password_encryption scram-sha-256
+  systemctl enable postgresql --now
+  systemctl restart postgresql
+  systemctl enable redis-server --now
+else
+  if [[ ! -s /var/lib/pgsql/data/PG_VERSION ]]; then
+    run_step "Inicializando o banco (initdb)" postgresql-setup --initdb
+  fi
+  PG_CONF=/var/lib/pgsql/data/postgresql.conf
+  PG_HBA=/var/lib/pgsql/data/pg_hba.conf
+  sed -i "s/^#\?port = .*/port = 5433/" "$PG_CONF"
+  # AlmaLinux/RHEL (ex.: PG13) ainda default para md5 — força scram-sha-256
+  # para bater com o método exigido abaixo no pg_hba (senão a autenticação
+  # falha mesmo com a senha certa, porque o hash salvo é de outro tipo).
+  echo "password_encryption = scram-sha-256" >> "$PG_CONF"
+  sed -i -E 's/^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)[[:space:]]+)ident/\1scram-sha-256/' "$PG_HBA"
+  systemctl enable postgresql --now
+  systemctl restart postgresql
+  systemctl enable redis --now
+fi
+log "PostgreSQL e Redis nativos ativos (porta do banco: 5433)"
 
-cat > "$INSTALL_DIR/docker-compose.prod.yml" <<DCEOF
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: zaptec-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: zaptec_prod
-      POSTGRES_USER: zaptec
-      POSTGRES_PASSWORD: "${DB_PASSWORD}"
-    ports:
-      - "127.0.0.1:5433:5432"
-    volumes:
-      - /opt/zaptec-data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U zaptec -d zaptec_prod"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-  redis:
-    image: redis:7-alpine
-    container_name: zaptec-redis
-    restart: unless-stopped
-    command: redis-server --save 60 1 --loglevel warning
-    ports:
-      - "127.0.0.1:6379:6379"
-    volumes:
-      - /opt/zaptec-data/redis:/data
-DCEOF
+info "Aguardando PostgreSQL aceitar conexões..."
+for i in {1..30}; do
+  su postgres -c "pg_isready -p 5433" &>/dev/null && break || sleep 1
+done
 
-docker compose -f "$INSTALL_DIR/docker-compose.prod.yml" up -d
-log "Containers iniciados"
+# Recria role e banco do zero (instalação sempre parte de um estado limpo,
+# igual ao comportamento anterior do container Docker recém-criado).
+# 'su' (não 'sudo') porque o script já roda como root e nem toda VPS tem o
+# pacote sudo instalado.
+su postgres -c "psql -p 5433 -v ON_ERROR_STOP=1" >/dev/null <<SQL
+DROP DATABASE IF EXISTS zaptec_prod;
+DROP ROLE IF EXISTS zaptec;
+CREATE ROLE zaptec LOGIN PASSWORD '${DB_PASSWORD}';
+CREATE DATABASE zaptec_prod OWNER zaptec;
+SQL
+log "Role 'zaptec' e banco 'zaptec_prod' criados"
 
 info "Aguardando banco ficar pronto..."
 for i in {1..30}; do
@@ -587,28 +615,36 @@ log "Banco pronto"
 # -------------------------------------------------------------
 section "Instalando Dependencias e Compilando"
 # -------------------------------------------------------------
-npm ci --quiet && log "Backend: dependencias instaladas"
-
+# --include=dev: garante tsc/vite no build mesmo se NODE_ENV=production estiver setado
+info "Estas etapas são as mais demoradas (podem levar alguns minutos, sem output). Aguarde o spinner."
+run_step "Instalando dependências do backend" npm ci --include=dev
 cd "$INSTALL_DIR/frontend"
-npm ci --quiet
-npm run build
-log "Frontend compilado"
-
+run_step "Instalando dependências do frontend" npm ci --include=dev
+run_step "Compilando o frontend (build)" npm run build
 cd "$INSTALL_DIR"
-npm run build
-log "Backend compilado"
+run_step "Compilando o backend (build)" npm run build
 npm prune --omit=dev --quiet 2>/dev/null || true
 
 # -------------------------------------------------------------
 section "Migracoes e Seed do Banco"
 # -------------------------------------------------------------
-npx prisma generate
-npx prisma migrate deploy
-log "Migracoes aplicadas"
+run_step "Gerando cliente Prisma" npx prisma generate
+run_step "Aplicando migrações do banco" npx prisma migrate deploy
 
 export ADMIN_EMAIL ADMIN_PASS
 ADMIN_EMAIL="$ADMIN_EMAIL" ADMIN_PASS="$ADMIN_PASS" npx tsx prisma/seed.ts && log "Seed executado"
 npx tsx prisma/seed-help.ts 2>/dev/null && log "Central de Ajuda populada" || warn "Seed de ajuda ignorado"
+
+# -------------------------------------------------------------
+section "Configurando Evolution API"
+# -------------------------------------------------------------
+# Setup idempotente: segredos, versão do WhatsApp Web, build da 2.4.0-rc2,
+# sobe o stack e aponta o ZapTec para a Evolution. Não aborta a instalação.
+if [[ -f "$INSTALL_DIR/deploy/evolution/setup-evolution.sh" ]]; then
+  INSTALL_DIR="$INSTALL_DIR" bash "$INSTALL_DIR/deploy/evolution/setup-evolution.sh" || warn "Setup da Evolution retornou aviso (não crítico)"
+else
+  warn "Script da Evolution não encontrado no repo — pulando."
+fi
 
 # -------------------------------------------------------------
 section "Configurando PM2"
@@ -724,23 +760,17 @@ F2BEOF
 systemctl enable fail2ban --now && log "Fail2ban ativado"
 
 mkdir -p /opt/zaptec-backups
-cat > /usr/local/bin/zaptec-backup <<'BKEOF'
-#!/bin/bash
-set -euo pipefail
-source /opt/zaptec/.env 2>/dev/null || exit 1
-DB_NAME=$(echo "$DATABASE_URL" | sed -E 's|.*/([^?]+).*|\1|')
-DB_USER=$(echo "$DATABASE_URL" | sed -E 's|.*://([^:]+):.*|\1|')
-DB_PASS=$(echo "$DATABASE_URL" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
-DATE=$(date +%Y%m%d_%H%M%S)
-docker exec zaptec-db \
-  sh -c "PGPASSWORD='${DB_PASS}' pg_dump -U '${DB_USER}' '${DB_NAME}'" \
-  | gzip > "/opt/zaptec-backups/backup_${DATE}.sql.gz"
-ls -t /opt/zaptec-backups/*.sql.gz 2>/dev/null | tail -n +8 | xargs -r rm
-echo "[$(date '+%Y-%m-%d %H:%M')] OK: backup_${DATE}.sql.gz"
-BKEOF
-chmod +x /usr/local/bin/zaptec-backup
-(crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/zaptec-backup >> /var/log/zaptec/backup.log 2>&1") | sort -u | crontab -
-log "Backup diario as 02:00"
+# Instala os scripts de backup e restauração a partir do repositório (fonte única —
+# sem fallback inline: se faltar, o clone está incompleto/corrompido e é melhor
+# falhar aqui do que instalar silenciosamente um backup incompleto sem mídia).
+if [[ ! -f "$INSTALL_DIR/deploy/zaptec-backup.sh" || ! -f "$INSTALL_DIR/deploy/zaptec-restore.sh" ]]; then
+  error "deploy/zaptec-backup.sh ou deploy/zaptec-restore.sh não encontrados no clone em $INSTALL_DIR. Repositório incompleto/corrompido."
+fi
+install -m 755 "$INSTALL_DIR/deploy/zaptec-backup.sh"  /usr/local/bin/zaptec-backup
+install -m 755 "$INSTALL_DIR/deploy/zaptec-restore.sh" /usr/local/bin/zaptec-restore
+log "Comandos 'zaptec-backup' e 'zaptec-restore' instalados"
+(crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/zaptec-backup --with-media >> /var/log/zaptec/backup.log 2>&1") | sort -u | crontab -
+log "Backup diario (banco + midias) as 02:00"
 
 # -------------------------------------------------------------
 cat > /root/zaptec-credentials.txt <<CREDSEOF
