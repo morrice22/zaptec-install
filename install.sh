@@ -482,6 +482,33 @@ run_step "Instalando o PM2" npm install -g pm2
 log "PM2: $(pm2 --version)"
 
 # -------------------------------------------------------------
+# Docker só é necessário para o proxy de migração do Ticketz (ticketz-mig-proxy
+# conecta na rede Docker do Ticketz do cliente) — o ZapTec em si não usa mais
+# Docker pra nada. 'detect_ticketz' também acha Ticketz por arquivo (.env),
+# então não dá pra assumir que o Docker já está instalado só porque
+# HAS_TICKETZ=true (o Ticketz do cliente pode nem rodar em Docker).
+if [[ "$HAS_TICKETZ" == true ]]; then
+  section "Instalando Docker (necessário para o proxy de migração Ticketz)"
+  if command -v docker &>/dev/null; then
+    log "Docker já instalado: $(docker --version)"
+  else
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL "https://download.docker.com/linux/$OS_ID/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS_ID $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+      apt-get update -qq
+      run_step "Instalando o Docker" apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    else
+      dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+      dnf install -y -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    fi
+    systemctl enable docker --now
+    log "Docker instalado: $(docker --version)"
+  fi
+fi
+
+# -------------------------------------------------------------
 section "Clonando Repositorio"
 # -------------------------------------------------------------
 [[ -d "$INSTALL_DIR" ]] && mv "$INSTALL_DIR" "${INSTALL_DIR}_bkp_$(date +%Y%m%d%H%M%S)"
