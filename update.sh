@@ -55,6 +55,84 @@ fi
 APP_PORT="${APP_PORT:-$(grep '^PORT=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r' || echo 3000)}"
 info "Porta backend: $APP_PORT | Certbot na VPS: ${USE_CERTBOT:-yes}"
 
+# ─── Migração automática: Postgres/Redis ainda em Docker → nativo ─────
+# Toda instalação feita antes desta versão do update.sh roda Postgres/Redis
+# via Docker (container "zaptec-db"). Detecta esse caso aqui e migra pra
+# nativo NESTA MESMA atualização, sem exigir passo manual em cada cliente.
+# Se qualquer etapa falhar depois de parar os containers antigos, eles são
+# religados automaticamente (a trap ERR abaixo) — o servidor não fica no ar
+# quebrado nem os dados antigos são removidos.
+migrate_docker_postgres_to_native() {
+  command -v docker &>/dev/null || return 0
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^zaptec-db$' || return 0
+
+  section "Migrando PostgreSQL/Redis de Docker para nativo"
+  warn "Detectado Postgres ainda em container Docker (zaptec-db) — migrando para systemd nesta atualização."
+
+  local DB_URL_MIG DB_NAME_MIG DB_USER_MIG DB_PASS_MIG DB_PORT_MIG DUMP_FILE PKG_FAMILY_MIG PG_VER_MIG
+  DB_URL_MIG=$(grep "^DATABASE_URL=" "$INSTALL_DIR/.env" | cut -d= -f2-)
+  DB_NAME_MIG=$(echo "$DB_URL_MIG" | sed -E 's|.*/([^?]+).*|\1|')
+  DB_USER_MIG=$(echo "$DB_URL_MIG" | sed -E 's|.*://([^:]+):.*|\1|')
+  DB_PASS_MIG=$(echo "$DB_URL_MIG" | sed -E 's|.*://[^:]+:([^@]+)@.*|\1|')
+  DB_PORT_MIG=$(echo "$DB_URL_MIG" | sed -E 's|.*://[^@]+@[^:/]+:([0-9]+).*|\1|')
+  [[ -z "$DB_PORT_MIG" ]] && DB_PORT_MIG=5433
+
+  mkdir -p /opt/zaptec-backups
+  DUMP_FILE="/opt/zaptec-backups/docker_migration_$(date +%Y%m%d_%H%M%S).sql.gz"
+  info "Extraindo dump do container Docker..."
+  docker exec zaptec-db sh -c "PGPASSWORD='${DB_PASS_MIG}' pg_dump -U '${DB_USER_MIG}' '${DB_NAME_MIG}'" | gzip > "$DUMP_FILE"
+  log "Dump salvo em $DUMP_FILE ($(du -h "$DUMP_FILE" | cut -f1))"
+
+  info "Parando containers Docker antigos (zaptec-db, zaptec-redis)..."
+  docker stop zaptec-db zaptec-redis 2>/dev/null || true
+
+  trap 'warn "Migração falhou — religando containers Docker antigos (dados intactos, dump salvo em '"$DUMP_FILE"')..."; docker start zaptec-db zaptec-redis 2>/dev/null || true' ERR
+
+  PKG_FAMILY_MIG="debian"
+  command -v apt-get &>/dev/null || PKG_FAMILY_MIG="rhel"
+
+  info "Instalando PostgreSQL/Redis nativos..."
+  if [[ "$PKG_FAMILY_MIG" == "debian" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq postgresql postgresql-contrib redis-server
+    PG_VER_MIG=$(ls /etc/postgresql/ 2>/dev/null | sort -Vr | head -1)
+    pg_conftool "$PG_VER_MIG" main set port "$DB_PORT_MIG"
+    pg_conftool "$PG_VER_MIG" main set password_encryption scram-sha-256
+    systemctl enable postgresql --now
+    systemctl restart postgresql
+    systemctl enable redis-server --now
+  else
+    dnf install -y -q --allowerasing postgresql-server postgresql-contrib redis
+    [[ -s /var/lib/pgsql/data/PG_VERSION ]] || postgresql-setup --initdb
+    sed -i "s/^#\?port = .*/port = ${DB_PORT_MIG}/" /var/lib/pgsql/data/postgresql.conf
+    echo "password_encryption = scram-sha-256" >> /var/lib/pgsql/data/postgresql.conf
+    sed -i -E 's/^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)[[:space:]]+)ident/\1scram-sha-256/' /var/lib/pgsql/data/pg_hba.conf
+    systemctl enable postgresql --now
+    systemctl restart postgresql
+    systemctl enable redis --now
+  fi
+
+  for i in $(seq 1 30); do su postgres -c "pg_isready -p ${DB_PORT_MIG}" &>/dev/null && break || sleep 1; done
+
+  info "Criando role/banco nativos com as mesmas credenciais do .env (nada muda no DATABASE_URL)..."
+  su postgres -c "psql -p ${DB_PORT_MIG} -v ON_ERROR_STOP=1" <<SQL
+DROP DATABASE IF EXISTS "${DB_NAME_MIG}";
+DROP ROLE IF EXISTS "${DB_USER_MIG}";
+CREATE ROLE "${DB_USER_MIG}" LOGIN PASSWORD '${DB_PASS_MIG}';
+CREATE DATABASE "${DB_NAME_MIG}" OWNER "${DB_USER_MIG}";
+SQL
+
+  info "Restaurando dump no banco nativo..."
+  zcat "$DUMP_FILE" | PGPASSWORD="${DB_PASS_MIG}" psql -h 127.0.0.1 -p "${DB_PORT_MIG}" -q -U "${DB_USER_MIG}" "${DB_NAME_MIG}"
+
+  trap - ERR
+  log "Migração Docker → nativo concluída. Containers antigos ficaram parados (não removidos) — reverter com: docker start zaptec-db zaptec-redis"
+  info "Dump de segurança da migração: $DUMP_FILE"
+}
+
+migrate_docker_postgres_to_native
+
 # ─── Verificar serviços dependentes ────────────────────────────
 section "Verificando Serviços"
 
