@@ -597,9 +597,12 @@ done
 # Recria role e banco do zero (instalação sempre parte de um estado limpo,
 # igual ao comportamento anterior do container Docker recém-criado).
 # 'su' (não 'sudo') porque o script já roda como root e nem toda VPS tem o
-# pacote sudo instalado.
+# pacote sudo instalado. WITH (FORCE) no DROP DATABASE: numa reexecução do
+# install.sh (ex.: tentativa anterior chegou a subir o PM2 antigo), pode haver
+# conexão ativa no banco — sem FORCE o DROP falha e o "banco novo" acaba não
+# sendo tão novo assim, causando P3005 (schema not empty) no migrate deploy.
 su postgres -c "psql -p 5433 -v ON_ERROR_STOP=1" >/dev/null <<SQL
-DROP DATABASE IF EXISTS zaptec_prod;
+DROP DATABASE IF EXISTS zaptec_prod WITH (FORCE);
 DROP ROLE IF EXISTS zaptec;
 CREATE ROLE zaptec LOGIN PASSWORD '${DB_PASSWORD}';
 CREATE DATABASE zaptec_prod OWNER zaptec;
